@@ -4,9 +4,10 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <cstring>
-#include <sstream>
+#include <sys/time.h>
 #include <algorithm>
 #include <limits>
+#include <format>
 
 namespace Http {
 
@@ -32,7 +33,7 @@ Response Fail(int statusCode, const std::string& body, const std::string& conten
 // --- Parsing ---
 
 std::string normalizePath(const std::string& path) {
-    if (path.empty() || path[0] != '/') {
+    if (path.empty() || !path.starts_with('/')) {
         return "/" + path;
     }
     return path;
@@ -40,12 +41,13 @@ std::string normalizePath(const std::string& path) {
 
 static std::vector<std::string> splitPath(const std::string& path) {
     std::vector<std::string> segments;
-    std::istringstream stream(normalizePath(path));
-    std::string segment;
-    while (std::getline(stream, segment, '/')) {
-        if (!segment.empty()) {
-            segments.push_back(segment);
-        }
+    auto norm = normalizePath(path);
+    size_t pos = 1;
+    while (pos < norm.size()) {
+        auto next = norm.find('/', pos);
+        if (next == std::string::npos) next = norm.size();
+        if (next > pos) segments.emplace_back(norm, pos, next - pos);
+        pos = next + 1;
     }
     return segments;
 }
@@ -54,16 +56,20 @@ std::vector<QueryParameterKeyValue> parseQueryString(const std::string& queryStr
     std::vector<QueryParameterKeyValue> params;
     if (queryString.empty()) return params;
 
-    std::istringstream stream(queryString);
-    std::string pair;
-    while (std::getline(stream, pair, '&')) {
-        if (pair.empty()) continue;
-        auto eq = pair.find('=');
-        if (eq != std::string::npos) {
-            params.push_back({pair.substr(0, eq), pair.substr(eq + 1)});
-        } else {
-            params.push_back({pair, ""});
+    size_t pos = 0;
+    while (pos < queryString.size()) {
+        auto amp = queryString.find('&', pos);
+        if (amp == std::string::npos) amp = queryString.size();
+        if (amp > pos) {
+            auto pair = queryString.substr(pos, amp - pos);
+            auto eq = pair.find('=');
+            if (eq != std::string::npos) {
+                params.push_back({pair.substr(0, eq), pair.substr(eq + 1)});
+            } else {
+                params.push_back({pair, ""});
+            }
         }
+        pos = amp + 1;
     }
     return params;
 }
@@ -83,7 +89,7 @@ bool matchRoute(const std::string& pattern, const std::string& path, std::vector
     }
 
     for (size_t i = 0; i < patternSegments.size(); ++i) {
-        if (!patternSegments[i].empty() && patternSegments[i][0] == ':') {
+        if (patternSegments[i].starts_with(':')) {
             outVariables.push_back(pathSegments[i]);
         } else if (patternSegments[i] != pathSegments[i]) {
             return false;
@@ -159,14 +165,9 @@ std::string formatResponse(int statusCode, const std::string& body, const std::s
         default:  statusText = "Unknown"; break;
     }
 
-    std::ostringstream response;
-    response << "HTTP/1.1 " << statusCode << " " << statusText << "\r\n";
-    response << "Content-Type: " << contentType << "\r\n";
-    response << "Content-Length: " << body.size() << "\r\n";
-    response << "Connection: close\r\n";
-    response << "\r\n";
-    response << body;
-    return response.str();
+    return std::format(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        statusCode, statusText, contentType, body.size(), body);
 }
 
 // --- Server ---
@@ -264,7 +265,9 @@ void Server::acceptLoop() {
 
         activeConnectionCount_++;
         std::thread([this, clientSocket]() {
-            handleConnection(clientSocket);
+            try {
+                handleConnection(clientSocket);
+            } catch (...) {}
             activeConnectionCount_--;
         }).detach();
     }
@@ -283,7 +286,11 @@ static int extractContentLength(const std::string& rawHeaders) {
     while (valueStart < lower.size() && lower[valueStart] == ' ') valueStart++;
     auto valueEnd = lower.find("\r\n", valueStart);
     if (valueEnd == std::string::npos) valueEnd = lower.size();
-    return std::stoi(rawHeaders.substr(valueStart, valueEnd - valueStart));
+    try {
+        return std::stoi(rawHeaders.substr(valueStart, valueEnd - valueStart));
+    } catch (...) {
+        return 0;
+    }
 }
 
 static std::string readFullRequest(int clientSocket) {
@@ -369,6 +376,11 @@ NextFunction Server::buildPipeline(RouteHandler matchedHandler, bool methodNotAl
 }
 
 void Server::handleConnection(int clientSocket) {
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     std::string rawRequest = readFullRequest(clientSocket);
     if (rawRequest.empty()) {
         close(clientSocket);

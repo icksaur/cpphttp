@@ -97,6 +97,26 @@ static int getResponseCode(const std::string& raw) {
     return std::stoi(raw.substr(sp1 + 1, sp2 - sp1 - 1));
 }
 
+static void waitForServer(int port, int maxRetries = 50) {
+    for (int i = 0; i < maxRetries; i++) {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+            close(sock);
+            return;
+        }
+        close(sock);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
 // ============================================================
 // Unit tests: parsing functions
 // ============================================================
@@ -468,23 +488,18 @@ TEST(test_stage_wraps_handler) {
     });
 
     server.start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    waitForServer(STAGE_PORT);
 
     auto resp = httpGet(STAGE_PORT, "/");
     ASSERT_EQ(getResponseCode(resp), 200);
     ASSERT_EQ(getResponseBody(resp), std::string("ok"));
-
-    // Give stage thread time to set the flag
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ASSERT(stageRan);
 
     server.stop();
 }
 
-static const int STAGE_PORT2 = 19878;
-
 TEST(test_stage_multiple_order) {
-    Http::Server server(STAGE_PORT2);
+    Http::Server server(STAGE_PORT);
     std::string order;
 
     server.get("/", [](Http::Context& ctx) {
@@ -504,10 +519,9 @@ TEST(test_stage_multiple_order) {
     });
 
     server.start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    waitForServer(STAGE_PORT);
 
-    httpGet(STAGE_PORT2, "/");
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    httpGet(STAGE_PORT, "/");
 
     // First-added stage is outermost: A enters, B enters, handler, B exits, A exits
     ASSERT_EQ(order, std::string("ABba"));
@@ -515,10 +529,8 @@ TEST(test_stage_multiple_order) {
     server.stop();
 }
 
-static const int STAGE_PORT3 = 19879;
-
 TEST(test_stage_short_circuit) {
-    Http::Server server(STAGE_PORT3);
+    Http::Server server(STAGE_PORT);
     bool handlerCalled = false;
 
     server.get("/", [&handlerCalled](Http::Context& ctx) {
@@ -532,10 +544,9 @@ TEST(test_stage_short_circuit) {
     });
 
     server.start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    waitForServer(STAGE_PORT);
 
-    auto resp = httpGet(STAGE_PORT3, "/");
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    auto resp = httpGet(STAGE_PORT, "/");
 
     ASSERT_EQ(getResponseCode(resp), 401);
     ASSERT_EQ(getResponseBody(resp), std::string("Unauthorized"));
@@ -544,10 +555,8 @@ TEST(test_stage_short_circuit) {
     server.stop();
 }
 
-static const int STAGE_PORT4 = 19880;
-
 TEST(test_stage_catches_exception) {
-    Http::Server server(STAGE_PORT4);
+    Http::Server server(STAGE_PORT);
 
     server.get("/", [](Http::Context& ctx) -> Http::Response {
         throw Http::HttpException(418, "I'm a teapot");
@@ -562,28 +571,26 @@ TEST(test_stage_catches_exception) {
     });
 
     server.start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    waitForServer(STAGE_PORT);
 
-    auto resp = httpGet(STAGE_PORT4, "/");
+    auto resp = httpGet(STAGE_PORT, "/");
     ASSERT_EQ(getResponseCode(resp), 418);
     ASSERT_EQ(getResponseBody(resp), std::string("I'm a teapot"));
 
     server.stop();
 }
 
-static const int STAGE_PORT5 = 19881;
-
 TEST(test_no_stages) {
-    Http::Server server(STAGE_PORT5);
+    Http::Server server(STAGE_PORT);
 
     server.get("/", [](Http::Context& ctx) {
         return Http::Ok("direct");
     });
 
     server.start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    waitForServer(STAGE_PORT);
 
-    auto resp = httpGet(STAGE_PORT5, "/");
+    auto resp = httpGet(STAGE_PORT, "/");
     ASSERT_EQ(getResponseCode(resp), 200);
     ASSERT_EQ(getResponseBody(resp), std::string("direct"));
 
@@ -617,7 +624,7 @@ int main() {
     Http::Server server(TEST_PORT);
     setupTestServer(server);
     server.start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    waitForServer(TEST_PORT);
 
     RUN(test_integration_get_root);
     RUN(test_integration_get_exact);

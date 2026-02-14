@@ -13,9 +13,9 @@ This is situational software intended only for the author's use, and does not ne
 ## build
 
 ```bash
-cmake . && cmake --build .
-./http_tests     # run tests
-./http_example   # run example server on port 53000
+cmake -B build && cmake --build build
+./build/http_tests     # run tests
+./build/http_example   # run example server on port 53000
 ```
 
 ## usage
