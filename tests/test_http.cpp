@@ -598,6 +598,569 @@ TEST(test_no_stages) {
 }
 
 // ============================================================
+// WebSocket Unit Tests
+// ============================================================
+
+TEST(test_sha1_empty) {
+    std::string hash = Http::sha1("");
+    ASSERT_EQ((int)hash.size(), 20);
+    // SHA-1 of empty string: da39a3ee5e6b4b0d3255bfef95601890afd80709
+    ASSERT_EQ((uint8_t)hash[0], 0xda);
+    ASSERT_EQ((uint8_t)hash[1], 0x39);
+}
+
+TEST(test_sha1_abc) {
+    std::string hash = Http::sha1("abc");
+    ASSERT_EQ((int)hash.size(), 20);
+    // SHA-1 of "abc": a9993e364706816aba3e25717850c26c9cd0d89d
+    ASSERT_EQ((uint8_t)hash[0], 0xa9);
+    ASSERT_EQ((uint8_t)hash[1], 0x99);
+}
+
+TEST(test_base64_empty) {
+    std::string encoded = Http::base64Encode("");
+    ASSERT_EQ(encoded, std::string(""));
+}
+
+TEST(test_base64_basic) {
+    ASSERT_EQ(Http::base64Encode("M"), std::string("TQ=="));
+    ASSERT_EQ(Http::base64Encode("Ma"), std::string("TWE="));
+    ASSERT_EQ(Http::base64Encode("Man"), std::string("TWFu"));
+}
+
+TEST(test_buildWebSocketAcceptKey) {
+    std::string clientKey = "dGhlIHNhbXBsZSBub25jZQ==";
+    std::string acceptKey = Http::buildWebSocketAcceptKey(clientKey);
+    ASSERT_EQ(acceptKey, std::string("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+}
+
+TEST(test_isWebSocketUpgrade_positive) {
+    Http::ParsedRequest req;
+    req.headers = {
+        {"Upgrade", "websocket"},
+        {"Connection", "Upgrade"}
+    };
+    ASSERT(Http::isWebSocketUpgrade(req));
+}
+
+TEST(test_isWebSocketUpgrade_case_insensitive) {
+    Http::ParsedRequest req;
+    req.headers = {
+        {"upgrade", "WebSocket"},
+        {"connection", "upgrade"}
+    };
+    ASSERT(Http::isWebSocketUpgrade(req));
+}
+
+TEST(test_isWebSocketUpgrade_missing_upgrade) {
+    Http::ParsedRequest req;
+    req.headers = {
+        {"Connection", "Upgrade"}
+    };
+    ASSERT(!Http::isWebSocketUpgrade(req));
+}
+
+TEST(test_isWebSocketUpgrade_wrong_values) {
+    Http::ParsedRequest req;
+    req.headers = {
+        {"Upgrade", "HTTP/2.0"},
+        {"Connection", "keep-alive"}
+    };
+    ASSERT(!Http::isWebSocketUpgrade(req));
+}
+
+TEST(test_buildWebSocketFrame_text) {
+    std::string frame = Http::buildWebSocketFrame(0x1, "hello");
+    ASSERT_EQ((int)frame.size(), 7);
+    ASSERT_EQ((uint8_t)frame[0], 0x81);  // FIN=1, opcode=1
+    ASSERT_EQ((uint8_t)frame[1], 5);     // length=5
+    ASSERT_EQ(frame.substr(2), std::string("hello"));
+}
+
+TEST(test_buildWebSocketFrame_binary) {
+    std::string payload = "data";
+    std::string frame = Http::buildWebSocketFrame(0x2, payload);
+    ASSERT_EQ((uint8_t)frame[0], 0x82);  // FIN=1, opcode=2
+}
+
+TEST(test_buildWebSocketFrame_close) {
+    std::string frame = Http::buildWebSocketFrame(0x8, "");
+    ASSERT_EQ((uint8_t)frame[0], 0x88);  // FIN=1, opcode=8
+    ASSERT_EQ((uint8_t)frame[1], 0);     // length=0
+}
+
+TEST(test_buildWebSocketFrame_ping) {
+    std::string frame = Http::buildWebSocketFrame(0x9, "ping");
+    ASSERT_EQ((uint8_t)frame[0], 0x89);
+}
+
+TEST(test_buildWebSocketFrame_pong) {
+    std::string frame = Http::buildWebSocketFrame(0xA, "pong");
+    ASSERT_EQ((uint8_t)frame[0], 0x8A);
+}
+
+TEST(test_buildWebSocketFrame_126_length) {
+    std::string payload(200, 'x');
+    std::string frame = Http::buildWebSocketFrame(0x1, payload);
+    ASSERT_EQ((uint8_t)frame[1], 126);
+    ASSERT_EQ((uint8_t)frame[2], 0);
+    ASSERT_EQ((uint8_t)frame[3], 200);
+}
+
+TEST(test_buildWebSocketFrame_64bit_length) {
+    std::string payload(70000, 'x');
+    std::string frame = Http::buildWebSocketFrame(0x1, payload);
+    ASSERT_EQ((uint8_t)frame[1], 127);
+}
+
+TEST(test_parseWebSocketFrame_text_unmasked) {
+    std::string raw = "\x81\x05hello";
+    size_t bytesConsumed = 0;
+    Http::WebSocketFrame frame = Http::parseWebSocketFrame(raw, bytesConsumed);
+    ASSERT(frame.fin);
+    ASSERT_EQ((int)frame.opcode, 0x1);
+    ASSERT_EQ(frame.payload, std::string("hello"));
+    ASSERT_EQ((int)bytesConsumed, 7);
+}
+
+TEST(test_parseWebSocketFrame_text_masked) {
+    // Masked "hello" with mask key [0x12, 0x34, 0x56, 0x78]
+    std::string raw = "\x81\x85\x12\x34\x56\x78";
+    raw += (char)(0x68 ^ 0x12);  // h
+    raw += (char)(0x65 ^ 0x34);  // e
+    raw += (char)(0x6c ^ 0x56);  // l
+    raw += (char)(0x6c ^ 0x78);  // l
+    raw += (char)(0x6f ^ 0x12);  // o
+    size_t bytesConsumed = 0;
+    Http::WebSocketFrame frame = Http::parseWebSocketFrame(raw, bytesConsumed);
+    ASSERT_EQ(frame.payload, std::string("hello"));
+    ASSERT_EQ((int)bytesConsumed, 11);
+}
+
+TEST(test_parseWebSocketFrame_binary) {
+    std::string raw;
+    raw += '\x82';
+    raw += '\x04';
+    raw += "data";
+    size_t bytesConsumed = 0;
+    Http::WebSocketFrame frame = Http::parseWebSocketFrame(raw, bytesConsumed);
+    ASSERT(frame.fin);
+    ASSERT_EQ((int)frame.opcode, 0x2);
+    ASSERT_EQ(frame.payload, std::string("data"));
+    ASSERT_EQ((int)bytesConsumed, 6);
+}
+
+TEST(test_parseWebSocketFrame_close) {
+    std::string raw;
+    raw += '\x88';
+    raw += '\x00';
+    size_t bytesConsumed = 0;
+    Http::WebSocketFrame frame = Http::parseWebSocketFrame(raw, bytesConsumed);
+    ASSERT(frame.fin);
+    ASSERT_EQ((int)frame.opcode, 0x8);
+    ASSERT_EQ((int)bytesConsumed, 2);
+}
+
+TEST(test_parseWebSocketFrame_ping) {
+    std::string raw;
+    raw += '\x89';
+    raw += '\x04';
+    raw += "ping";
+    size_t bytesConsumed = 0;
+    Http::WebSocketFrame frame = Http::parseWebSocketFrame(raw, bytesConsumed);
+    ASSERT_EQ((int)frame.opcode, 0x9);
+    ASSERT_EQ(frame.payload, std::string("ping"));
+    ASSERT_EQ((int)bytesConsumed, 6);
+}
+
+TEST(test_parseWebSocketFrame_continuation_fin0) {
+    std::string raw;
+    raw += '\x00';
+    raw += '\x03';
+    raw += "abc";
+    size_t bytesConsumed = 0;
+    Http::WebSocketFrame frame = Http::parseWebSocketFrame(raw, bytesConsumed);
+    ASSERT(!frame.fin);
+    ASSERT_EQ((int)frame.opcode, 0x0);
+    ASSERT_EQ(frame.payload, std::string("abc"));
+    ASSERT_EQ((int)bytesConsumed, 5);
+}
+
+TEST(test_parseWebSocketFrame_text_fin0) {
+    std::string raw;
+    raw += '\x01';
+    raw += '\x03';
+    raw += "abc";
+    size_t bytesConsumed = 0;
+    Http::WebSocketFrame frame = Http::parseWebSocketFrame(raw, bytesConsumed);
+    ASSERT(!frame.fin);
+    ASSERT_EQ((int)frame.opcode, 0x1);
+    ASSERT_EQ((int)bytesConsumed, 5);
+}
+
+TEST(test_parseWebSocketFrame_126_length) {
+    std::string payload(200, 'x');
+    std::string raw;
+    raw += '\x81';
+    raw += '\x7e';
+    raw += '\x00';
+    raw += '\xc8';
+    raw += payload;
+    size_t bytesConsumed = 0;
+    Http::WebSocketFrame frame = Http::parseWebSocketFrame(raw, bytesConsumed);
+    ASSERT_EQ((int)frame.payload.size(), 200);
+    ASSERT_EQ((int)bytesConsumed, 204);
+}
+
+// ============================================================
+// WebSocket Integration Tests
+// ============================================================
+
+static std::string wsHandshake(int port, const std::string& path, const std::string& clientKey) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return "";
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        close(sock);
+        return "";
+    }
+
+    std::string req = "GET " + path + " HTTP/1.1\r\n"
+                      "Host: localhost\r\n"
+                      "Upgrade: websocket\r\n"
+                      "Connection: Upgrade\r\n"
+                      "Sec-WebSocket-Key: " + clientKey + "\r\n"
+                      "Sec-WebSocket-Version: 13\r\n\r\n";
+    send(sock, req.c_str(), req.size(), 0);
+
+    std::string response;
+    char buf[4096];
+    ssize_t n = recv(sock, buf, sizeof(buf), 0);
+    if (n > 0) {
+        response.append(buf, n);
+    }
+
+    close(sock);
+    return response;
+}
+
+static int wsConnect(int port, const std::string& path) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    std::string clientKey = "dGhlIHNhbXBsZSBub25jZQ==";
+    std::string req = "GET " + path + " HTTP/1.1\r\n"
+                      "Host: localhost\r\n"
+                      "Upgrade: websocket\r\n"
+                      "Connection: Upgrade\r\n"
+                      "Sec-WebSocket-Key: " + clientKey + "\r\n"
+                      "Sec-WebSocket-Version: 13\r\n\r\n";
+    send(sock, req.c_str(), req.size(), 0);
+
+    // Read handshake response
+    char buf[4096];
+    recv(sock, buf, sizeof(buf), 0);
+    
+    return sock;
+}
+
+static void wsSendTextFrame(int sock, const std::string& text) {
+    std::string frame;
+    frame += (char)0x81;  // FIN=1, opcode=1
+    
+    size_t len = text.size();
+    if (len < 126) {
+        frame += (char)(0x80 | len);  // MASK=1
+    } else {
+        frame += (char)0xFE;  // MASK=1, len=126
+        frame += (char)((len >> 8) & 0xFF);
+        frame += (char)(len & 0xFF);
+    }
+    
+    // Mask key
+    uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78};
+    frame.append((char*)mask, 4);
+    
+    // Masked payload
+    for (size_t i = 0; i < text.size(); ++i) {
+        frame += (char)(text[i] ^ mask[i % 4]);
+    }
+    
+    send(sock, frame.c_str(), frame.size(), 0);
+}
+
+static std::string wsRecvFrame(int sock) {
+    char buf[4096];
+    ssize_t n = recv(sock, buf, sizeof(buf), 0);
+    if (n <= 0) return "";
+    
+    std::string raw(buf, n);
+    if (raw.size() < 2) return "";
+    
+    size_t bytesConsumed = 0;
+    Http::WebSocketFrame frame = Http::parseWebSocketFrame(raw, bytesConsumed);
+    return frame.payload;
+}
+
+TEST(test_ws_handshake) {
+    constexpr int WS_PORT = 53100;
+    Http::Server server(WS_PORT);
+    
+    bool opened = false;
+    server.ws("/echo", {
+        .onOpen = [&](Http::WebSocketHandle) { opened = true; },
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+    
+    server.start();
+    waitForServer(WS_PORT);
+    
+    std::string clientKey = "dGhlIHNhbXBsZSBub25jZQ==";
+    std::string response = wsHandshake(WS_PORT, "/echo", clientKey);
+    
+    ASSERT(response.find("101") != std::string::npos);
+    ASSERT(response.find("Upgrade: websocket") != std::string::npos);
+    ASSERT(response.find("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != std::string::npos);
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT(opened);
+    
+    server.stop();
+}
+
+TEST(test_ws_echo) {
+    constexpr int WS_PORT = 53101;
+    Http::Server server(WS_PORT);
+    
+    server.ws("/echo", {
+        .onOpen = [&](Http::WebSocketHandle handle) {
+            server.send(handle, "connected");
+        },
+        .onMessage = [&](Http::WebSocketHandle handle, Http::WebSocketMessage msg) {
+            server.send(handle, msg.data);
+        },
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+    
+    server.start();
+    waitForServer(WS_PORT);
+    
+    int sock = wsConnect(WS_PORT, "/echo");
+    ASSERT(sock >= 0);
+    
+    // Receive "connected" message
+    std::string msg = wsRecvFrame(sock);
+    ASSERT_EQ(msg, std::string("connected"));
+    
+    // Send echo test
+    wsSendTextFrame(sock, "hello");
+    msg = wsRecvFrame(sock);
+    ASSERT_EQ(msg, std::string("hello"));
+    
+    close(sock);
+    server.stop();
+}
+
+TEST(test_ws_server_push) {
+    constexpr int WS_PORT = 53102;
+    Http::Server server(WS_PORT);
+    
+    std::vector<Http::WebSocketHandle> clients;
+    std::mutex clientsMutex;
+    
+    server.ws("/feed", {
+        .onOpen = [&](Http::WebSocketHandle handle) {
+            std::lock_guard lock(clientsMutex);
+            clients.push_back(handle);
+        },
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [&](Http::WebSocketHandle handle) {
+            std::lock_guard lock(clientsMutex);
+            std::erase(clients, handle);
+        }
+    });
+    
+    server.start();
+    waitForServer(WS_PORT);
+    
+    int sock1 = wsConnect(WS_PORT, "/feed");
+    int sock2 = wsConnect(WS_PORT, "/feed");
+    ASSERT(sock1 >= 0 && sock2 >= 0);
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    
+    // Push to all clients
+    {
+        std::lock_guard lock(clientsMutex);
+        ASSERT_EQ((int)clients.size(), 2);
+        for (auto handle : clients) {
+            server.send(handle, "broadcast");
+        }
+    }
+    
+    std::string msg1 = wsRecvFrame(sock1);
+    std::string msg2 = wsRecvFrame(sock2);
+    ASSERT_EQ(msg1, std::string("broadcast"));
+    ASSERT_EQ(msg2, std::string("broadcast"));
+    
+    close(sock1);
+    close(sock2);
+    server.stop();
+}
+
+TEST(test_ws_route_variables) {
+    constexpr int WS_PORT = 53103;
+    Http::Server server(WS_PORT);
+    
+    std::string capturedRoom;
+    server.ws("/chat/:room", {
+        .onOpen = [&](Http::WebSocketHandle handle) {
+            auto vars = server.getRouteVariables(handle);
+            if (!vars.empty()) capturedRoom = vars[0];
+        },
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+    
+    server.start();
+    waitForServer(WS_PORT);
+    
+    int sock = wsConnect(WS_PORT, "/chat/lobby");
+    ASSERT(sock >= 0);
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_EQ(capturedRoom, std::string("lobby"));
+    
+    close(sock);
+    server.stop();
+}
+
+TEST(test_ws_binary_message) {
+    constexpr int WS_PORT = 53104;
+    Http::Server server(WS_PORT);
+    
+    server.ws("/binary", {
+        .onOpen = [&](Http::WebSocketHandle handle) {
+            std::vector<uint8_t> data = {0x01, 0x02, 0x03, 0x04};
+            server.send(handle, data);
+        },
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+    
+    server.start();
+    waitForServer(WS_PORT);
+    
+    int sock = wsConnect(WS_PORT, "/binary");
+    ASSERT(sock >= 0);
+    
+    char buf[4096];
+    ssize_t n = recv(sock, buf, sizeof(buf), 0);
+    ASSERT(n > 0);
+    
+    std::string raw(buf, n);
+    size_t bytesConsumed = 0;
+    Http::WebSocketFrame frame = Http::parseWebSocketFrame(raw, bytesConsumed);
+    ASSERT_EQ((int)frame.opcode, 0x2);  // binary
+    ASSERT_EQ((int)frame.payload.size(), 4);
+    
+    close(sock);
+    server.stop();
+}
+
+TEST(test_ws_invalid_handle) {
+    constexpr int WS_PORT = 53105;
+    Http::Server server(WS_PORT);
+    
+    server.ws("/test", {
+        .onOpen = [](Http::WebSocketHandle) {},
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+    
+    server.start();
+    waitForServer(WS_PORT);
+    
+    bool result = server.send(99999, "test");
+    ASSERT(!result);
+    
+    server.stop();
+}
+
+TEST(test_ws_nonexistent_route_404) {
+    constexpr int WS_PORT = 53106;
+    Http::Server server(WS_PORT);
+    
+    server.ws("/exists", {
+        .onOpen = [](Http::WebSocketHandle) {},
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+    
+    server.start();
+    waitForServer(WS_PORT);
+    
+    std::string response = wsHandshake(WS_PORT, "/notfound", "dGhlIHNhbXBsZSBub25jZQ==");
+    ASSERT(response.find("404") != std::string::npos);
+    
+    server.stop();
+}
+
+TEST(test_ws_close_connection) {
+    constexpr int WS_PORT = 53107;
+    Http::Server server(WS_PORT);
+    
+    bool closed = false;
+    server.ws("/test", {
+        .onOpen = [&](Http::WebSocketHandle handle) {
+            server.closeConnection(handle);
+        },
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [&](Http::WebSocketHandle) {
+            closed = true;
+        }
+    });
+    
+    server.start();
+    waitForServer(WS_PORT);
+    
+    int sock = wsConnect(WS_PORT, "/test");
+    ASSERT(sock >= 0);
+    
+    // Should receive close frame
+    char buf[4096];
+    ssize_t n = recv(sock, buf, sizeof(buf), 0);
+    ASSERT(n > 0);
+    
+    std::string raw(buf, n);
+    size_t bytesConsumed = 0;
+    Http::WebSocketFrame frame = Http::parseWebSocketFrame(raw, bytesConsumed);
+    ASSERT_EQ((int)frame.opcode, 0x8);  // close
+    
+    close(sock);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT(closed);
+    
+    server.stop();
+}
+
+// ============================================================
 
 int main() {
     std::cout << "=== Unit tests ===" << std::endl;
@@ -657,6 +1220,42 @@ int main() {
     RUN(test_stage_multiple_order);
     RUN(test_stage_short_circuit);
     RUN(test_stage_catches_exception);
+
+    std::cout << "\n=== WebSocket unit tests ===" << std::endl;
+    RUN(test_sha1_empty);
+    RUN(test_sha1_abc);
+    RUN(test_base64_empty);
+    RUN(test_base64_basic);
+    RUN(test_buildWebSocketAcceptKey);
+    RUN(test_isWebSocketUpgrade_positive);
+    RUN(test_isWebSocketUpgrade_case_insensitive);
+    RUN(test_isWebSocketUpgrade_missing_upgrade);
+    RUN(test_isWebSocketUpgrade_wrong_values);
+    RUN(test_buildWebSocketFrame_text);
+    RUN(test_buildWebSocketFrame_binary);
+    RUN(test_buildWebSocketFrame_close);
+    RUN(test_buildWebSocketFrame_ping);
+    RUN(test_buildWebSocketFrame_pong);
+    RUN(test_buildWebSocketFrame_126_length);
+    RUN(test_buildWebSocketFrame_64bit_length);
+    RUN(test_parseWebSocketFrame_text_unmasked);
+    RUN(test_parseWebSocketFrame_text_masked);
+    RUN(test_parseWebSocketFrame_binary);
+    RUN(test_parseWebSocketFrame_close);
+    RUN(test_parseWebSocketFrame_ping);
+    RUN(test_parseWebSocketFrame_continuation_fin0);
+    RUN(test_parseWebSocketFrame_text_fin0);
+    RUN(test_parseWebSocketFrame_126_length);
+
+    std::cout << "\n=== WebSocket integration tests ===" << std::endl;
+    RUN(test_ws_handshake);
+    RUN(test_ws_echo);
+    RUN(test_ws_server_push);
+    RUN(test_ws_route_variables);
+    RUN(test_ws_binary_message);
+    RUN(test_ws_invalid_handle);
+    RUN(test_ws_nonexistent_route_404);
+    RUN(test_ws_close_connection);
 
     std::cout << "\n=== Results ===" << std::endl;
     std::cout << "Passed: " << passed << std::endl;

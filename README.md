@@ -161,3 +161,85 @@ http.addStage([](Http::Context& ctx, Http::NextFunction next) {
     }
 });
 ```
+
+## WebSocket support
+
+The library supports WebSocket connections for bidirectional communication. WebSocket routes are registered similarly to HTTP routes.
+
+### Echo server
+
+```cpp
+http.ws("/echo", {
+    .onOpen = [&](Http::WebSocketHandle handle) {
+        http.send(handle, "connected");
+    },
+    .onMessage = [&](Http::WebSocketHandle handle, Http::WebSocketMessage msg) {
+        http.send(handle, msg.data);
+    },
+    .onClose = [](Http::WebSocketHandle) {}
+});
+```
+
+### Server-to-client push
+
+```cpp
+std::vector<Http::WebSocketHandle> clients;
+std::mutex clientsMutex;
+
+http.ws("/feed", {
+    .onOpen = [&](Http::WebSocketHandle handle) {
+        std::lock_guard lock(clientsMutex);
+        clients.push_back(handle);
+    },
+    .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+    .onClose = [&](Http::WebSocketHandle handle) {
+        std::lock_guard lock(clientsMutex);
+        std::erase(clients, handle);
+    }
+});
+
+// Push data from any thread
+{
+    std::lock_guard lock(clientsMutex);
+    for (auto handle : clients) {
+        http.send(handle, "notification");
+    }
+}
+```
+
+### Route variables
+
+WebSocket routes support the same path patterns as HTTP routes:
+
+```cpp
+http.ws("/chat/:room", {
+    .onOpen = [&](Http::WebSocketHandle handle) {
+        auto vars = http.getRouteVariables(handle);
+        std::string room = vars[0];
+        // ... join room
+    },
+    .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+    .onClose = [](Http::WebSocketHandle) {}
+});
+```
+
+### WebSocket API
+
+**Types:**
+- `WebSocketHandle` — uint64_t identifier for a connection (copyable, storable)
+- `WebSocketMessage` — `{uint8_t opcode, std::string data}` where opcode is 0x1 (text) or 0x2 (binary)
+- `WebSocketHandler` — `{onOpen, onMessage, onClose}` callbacks
+
+**Server methods:**
+- `ws(path, handler)` — register WebSocket route
+- `send(handle, string)` → bool — send text message, returns false if connection closed
+- `send(handle, vector<uint8_t>)` → bool — send binary message
+- `closeConnection(handle)` — server-initiated close
+- `getRouteVariables(handle)` → vector<string> — route variables captured at handshake
+
+**Features:**
+- Handle-based API — server owns connections, callers hold lightweight handles
+- Thread-safe `send()` — push from any thread
+- Fragmented message reassembly
+- Automatic ping/pong handling
+- Clean shutdown integration
