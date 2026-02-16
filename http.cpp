@@ -430,6 +430,30 @@ std::vector<std::string> Server::getRouteVariables(WebSocketHandle handle) {
     return it->second.routeVariables;
 }
 
+std::vector<WebSocketHandle> Server::findBroadcastTargets(const std::string& path) {
+    auto normalized = normalizePath(path);
+    std::vector<WebSocketHandle> targets;
+    std::lock_guard lock(wsConnectionsMutex_);
+    for (const auto& [handle, conn] : wsConnections_) {
+        if (conn.routePattern == normalized) {
+            targets.push_back(handle);
+        }
+    }
+    return targets;
+}
+
+void Server::broadcast(const std::string& path, const std::string& message) {
+    for (auto handle : findBroadcastTargets(path)) {
+        send(handle, message);
+    }
+}
+
+void Server::broadcast(const std::string& path, const std::vector<uint8_t>& message) {
+    for (auto handle : findBroadcastTargets(path)) {
+        send(handle, message);
+    }
+}
+
 void Server::addRoute(const std::string& verb, const std::string& path, RouteHandler handler) {
     routes_.push_back({verb, normalizePath(path), std::move(handler)});
 }
@@ -521,7 +545,7 @@ void Server::acceptLoop() {
 
 static constexpr size_t MAX_REQUEST_SIZE = 1024 * 1024;
 
-static int extractContentLength(const std::string& rawHeaders) {
+static size_t extractContentLength(const std::string& rawHeaders) {
     std::string lower = rawHeaders;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
     auto pos = lower.find("content-length:");
@@ -531,7 +555,7 @@ static int extractContentLength(const std::string& rawHeaders) {
     auto valueEnd = lower.find("\r\n", valueStart);
     if (valueEnd == std::string::npos) valueEnd = lower.size();
     try {
-        return std::stoi(rawHeaders.substr(valueStart, valueEnd - valueStart));
+        return std::stoull(rawHeaders.substr(valueStart, valueEnd - valueStart));
     } catch (...) {
         return 0;
     }
@@ -550,10 +574,10 @@ static std::string readFullRequest(int clientSocket) {
     }
 
     auto headerEnd = raw.find("\r\n\r\n");
-    int contentLength = extractContentLength(raw.substr(0, headerEnd));
+    size_t contentLength = extractContentLength(raw.substr(0, headerEnd));
 
     size_t bodyReceived = raw.size() - (headerEnd + 4);
-    while (static_cast<int>(bodyReceived) < contentLength) {
+    while (bodyReceived < contentLength) {
         if (raw.size() > MAX_REQUEST_SIZE) return "";
         ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer), 0);
         if (bytesRead <= 0) break;
@@ -639,7 +663,7 @@ void Server::handleConnection(int clientSocket) {
         for (const auto& wsRoute : wsRoutes_) {
             std::vector<std::string> vars;
             if (matchRoute(wsRoute.pattern, parsed.path, vars)) {
-                handleWebSocketConnection(clientSocket, parsed, wsRoute.handler, vars);
+                handleWebSocketConnection(clientSocket, parsed, wsRoute.handler, vars, wsRoute.pattern);
                 return;
             }
         }
@@ -670,9 +694,72 @@ void Server::handleConnection(int clientSocket) {
     ::send(clientSocket, response.c_str(), response.size(), 0);
 }
 
+bool Server::dispatchWebSocketFrame(const WebSocketFrame& frame, WebSocketHandle handle, 
+                                     const WebSocketHandler& handler, 
+                                     std::shared_ptr<std::mutex> writeMutex, 
+                                     int clientSocket) {
+    static constexpr size_t MAX_MESSAGE_SIZE = 1024 * 1024;
+    
+    if (frame.opcode == 0x8) {  // Close
+        std::lock_guard writeLock(*writeMutex);
+        std::string closeFrame = buildWebSocketFrame(0x8, "");
+        ::send(clientSocket, closeFrame.c_str(), closeFrame.size(), 0);
+        return true;  // Signal to exit loop
+    } else if (frame.opcode == 0x9) {  // Ping
+        std::lock_guard writeLock(*writeMutex);
+        std::string pongFrame = buildWebSocketFrame(0xA, frame.payload);
+        ::send(clientSocket, pongFrame.c_str(), pongFrame.size(), 0);
+    } else if (frame.opcode == 0x1 || frame.opcode == 0x2) {  // Text or Binary
+        if (frame.fin) {
+            // Complete message
+            if (handler.onMessage) {
+                try {
+                    handler.onMessage(handle, {frame.opcode, frame.payload});
+                } catch (...) {}
+            }
+        } else {
+            // Start of fragmented message
+            std::lock_guard lock(wsConnectionsMutex_);
+            auto it = wsConnections_.find(handle);
+            if (it != wsConnections_.end()) {
+                it->second.fragmentOpcode = frame.opcode;
+                it->second.fragmentBuffer = frame.payload;
+            }
+        }
+    } else if (frame.opcode == 0x0) {  // Continuation
+        std::lock_guard lock(wsConnectionsMutex_);
+        auto it = wsConnections_.find(handle);
+        if (it != wsConnections_.end()) {
+            it->second.fragmentBuffer += frame.payload;
+            if (it->second.fragmentBuffer.size() > MAX_MESSAGE_SIZE) {
+                return true;  // Signal to exit loop
+            }
+            if (frame.fin) {
+                // Complete fragmented message
+                if (handler.onMessage) {
+                    try {
+                        handler.onMessage(handle, {it->second.fragmentOpcode, it->second.fragmentBuffer});
+                    } catch (...) {}
+                }
+                it->second.fragmentBuffer.clear();
+                it->second.fragmentOpcode = 0;
+            }
+        }
+    }
+    
+    return false;  // Continue loop
+}
+
 void Server::handleWebSocketConnection(int clientSocket, const ParsedRequest& request, 
                                         const WebSocketHandler& handler,
-                                        const std::vector<std::string>& routeVariables) {
+                                        const std::vector<std::string>& routeVariables,
+                                        const std::string& routePattern) {
+    // Set longer timeout for WebSocket connections (60 seconds instead of 5)
+    struct timeval tv;
+    tv.tv_sec = 60;
+    tv.tv_usec = 0;
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
     // Extract WebSocket key
     std::string clientKey;
     for (const auto& h : request.headers) {
@@ -709,6 +796,7 @@ void Server::handleWebSocketConnection(int clientSocket, const ParsedRequest& re
             clientSocket,
             writeMutex,
             routeVariables,
+            routePattern,
             "",
             0
         };
@@ -722,7 +810,6 @@ void Server::handleWebSocketConnection(int clientSocket, const ParsedRequest& re
     }
 
     // Message loop
-    static constexpr size_t MAX_MESSAGE_SIZE = 1024 * 1024;
     char buffer[4096];
     std::string recvBuffer;
     bool done = false;
@@ -740,56 +827,9 @@ void Server::handleWebSocketConnection(int clientSocket, const ParsedRequest& re
             if (bytesConsumed == 0) break;  // Need more data
 
             recvBuffer.erase(0, bytesConsumed);
-
-            // Handle frame
-            if (frame.opcode == 0x8) {  // Close
-                std::lock_guard writeLock(*writeMutex);
-                std::string closeFrame = buildWebSocketFrame(0x8, "");
-                ::send(clientSocket, closeFrame.c_str(), closeFrame.size(), 0);
-                done = true;
-                break;
-            } else if (frame.opcode == 0x9) {  // Ping
-                std::lock_guard writeLock(*writeMutex);
-                std::string pongFrame = buildWebSocketFrame(0xA, frame.payload);
-                ::send(clientSocket, pongFrame.c_str(), pongFrame.size(), 0);
-            } else if (frame.opcode == 0x1 || frame.opcode == 0x2) {  // Text or Binary
-                if (frame.fin) {
-                    // Complete message
-                    if (handler.onMessage) {
-                        try {
-                            handler.onMessage(handle, {frame.opcode, frame.payload});
-                        } catch (...) {}
-                    }
-                } else {
-                    // Start of fragmented message
-                    std::lock_guard lock(wsConnectionsMutex_);
-                    auto it = wsConnections_.find(handle);
-                    if (it != wsConnections_.end()) {
-                        it->second.fragmentOpcode = frame.opcode;
-                        it->second.fragmentBuffer = frame.payload;
-                    }
-                }
-            } else if (frame.opcode == 0x0) {  // Continuation
-                std::lock_guard lock(wsConnectionsMutex_);
-                auto it = wsConnections_.find(handle);
-                if (it != wsConnections_.end()) {
-                    it->second.fragmentBuffer += frame.payload;
-                    if (it->second.fragmentBuffer.size() > MAX_MESSAGE_SIZE) {
-                        done = true;
-                        break;
-                    }
-                    if (frame.fin) {
-                        // Complete fragmented message
-                        if (handler.onMessage) {
-                            try {
-                                handler.onMessage(handle, {it->second.fragmentOpcode, it->second.fragmentBuffer});
-                            } catch (...) {}
-                        }
-                        it->second.fragmentBuffer.clear();
-                        it->second.fragmentOpcode = 0;
-                    }
-                }
-            }
+            
+            done = dispatchWebSocketFrame(frame, handle, handler, writeMutex, clientSocket);
+            if (done) break;
         }
     }
 

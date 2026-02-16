@@ -1,121 +1,7 @@
 #include "http.h"
+#include "test_helpers.h"
 
-#include <iostream>
 #include <cstring>
-#include <thread>
-#include <chrono>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-
-static int passed = 0;
-static int failed = 0;
-
-#define ASSERT(cond) do { \
-    if (!(cond)) { \
-        std::cerr << "  FAIL: " << #cond << " (" << __FILE__ << ":" << __LINE__ << ")" << std::endl; \
-        failed++; \
-    } else { \
-        passed++; \
-    } \
-} while(0)
-
-#define ASSERT_EQ(a, b) do { \
-    auto _a = (a); auto _b = (b); \
-    if (_a != _b) { \
-        std::cerr << "  FAIL: " << #a << " == " << #b << " (got '" << _a << "' vs '" << _b << "') at " << __FILE__ << ":" << __LINE__ << std::endl; \
-        failed++; \
-    } else { \
-        passed++; \
-    } \
-} while(0)
-
-#define TEST(name) static void name()
-#define RUN(name) do { \
-    std::cout << "  " << #name << std::endl; \
-    name(); \
-} while(0)
-
-// --- Helper: send raw HTTP request and get response ---
-
-static std::string sendRequest(int port, const std::string& raw) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return "";
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
-    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        close(sock);
-        return "";
-    }
-
-    send(sock, raw.c_str(), raw.size(), 0);
-
-    std::string response;
-    char buf[4096];
-    while (true) {
-        ssize_t n = recv(sock, buf, sizeof(buf), 0);
-        if (n <= 0) break;
-        response.append(buf, n);
-    }
-
-    close(sock);
-    return response;
-}
-
-static std::string httpGet(int port, const std::string& path) {
-    std::string req = "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    return sendRequest(port, req);
-}
-
-static std::string httpVerb(int port, const std::string& verb, const std::string& path, const std::string& body = "") {
-    std::string req = verb + " " + path + " HTTP/1.1\r\nHost: localhost\r\n";
-    if (!body.empty()) {
-        req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-    }
-    req += "Connection: close\r\n\r\n";
-    req += body;
-    return sendRequest(port, req);
-}
-
-static std::string getResponseBody(const std::string& raw) {
-    auto pos = raw.find("\r\n\r\n");
-    if (pos == std::string::npos) return "";
-    return raw.substr(pos + 4);
-}
-
-static int getResponseCode(const std::string& raw) {
-    // HTTP/1.1 200 OK
-    auto sp1 = raw.find(' ');
-    if (sp1 == std::string::npos) return 0;
-    auto sp2 = raw.find(' ', sp1 + 1);
-    if (sp2 == std::string::npos) return 0;
-    return std::stoi(raw.substr(sp1 + 1, sp2 - sp1 - 1));
-}
-
-static void waitForServer(int port, int maxRetries = 50) {
-    for (int i = 0; i < maxRetries; i++) {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
-        }
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-        if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
-            close(sock);
-            return;
-        }
-        close(sock);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-}
 
 // ============================================================
 // Unit tests: parsing functions
@@ -1161,6 +1047,184 @@ TEST(test_ws_close_connection) {
 }
 
 // ============================================================
+// Broadcast tests
+// ============================================================
+
+TEST(test_broadcast_text) {
+    constexpr int WS_PORT = 53108;
+    Http::Server server(WS_PORT);
+
+    server.ws("/chat", {
+        .onOpen = [](Http::WebSocketHandle) {},
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+
+    server.start();
+    waitForServer(WS_PORT);
+
+    int sock1 = wsConnect(WS_PORT, "/chat");
+    int sock2 = wsConnect(WS_PORT, "/chat");
+    ASSERT(sock1 >= 0 && sock2 >= 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    server.broadcast("/chat", "hello all");
+
+    std::string msg1 = wsRecvFrame(sock1);
+    std::string msg2 = wsRecvFrame(sock2);
+    ASSERT_EQ(msg1, std::string("hello all"));
+    ASSERT_EQ(msg2, std::string("hello all"));
+
+    close(sock1);
+    close(sock2);
+    server.stop();
+}
+
+TEST(test_broadcast_binary) {
+    constexpr int WS_PORT = 53109;
+    Http::Server server(WS_PORT);
+
+    server.ws("/bin", {
+        .onOpen = [](Http::WebSocketHandle) {},
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+
+    server.start();
+    waitForServer(WS_PORT);
+
+    int sock1 = wsConnect(WS_PORT, "/bin");
+    int sock2 = wsConnect(WS_PORT, "/bin");
+    ASSERT(sock1 >= 0 && sock2 >= 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    std::vector<uint8_t> data = {0xDE, 0xAD, 0xBE, 0xEF};
+    server.broadcast("/bin", data);
+
+    // Read raw frames to check opcode
+    char buf[4096];
+    ssize_t n1 = recv(sock1, buf, sizeof(buf), 0);
+    ASSERT(n1 > 0);
+    std::string raw1(buf, n1);
+    size_t consumed = 0;
+    Http::WebSocketFrame frame1 = Http::parseWebSocketFrame(raw1, consumed);
+    ASSERT_EQ((int)frame1.opcode, 0x2);
+    ASSERT_EQ((int)frame1.payload.size(), 4);
+
+    ssize_t n2 = recv(sock2, buf, sizeof(buf), 0);
+    ASSERT(n2 > 0);
+    std::string raw2(buf, n2);
+    consumed = 0;
+    Http::WebSocketFrame frame2 = Http::parseWebSocketFrame(raw2, consumed);
+    ASSERT_EQ((int)frame2.opcode, 0x2);
+    ASSERT_EQ((int)frame2.payload.size(), 4);
+
+    close(sock1);
+    close(sock2);
+    server.stop();
+}
+
+TEST(test_broadcast_no_connections) {
+    constexpr int WS_PORT = 53110;
+    Http::Server server(WS_PORT);
+
+    server.ws("/empty", {
+        .onOpen = [](Http::WebSocketHandle) {},
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+
+    server.start();
+    waitForServer(WS_PORT);
+
+    // Should not crash
+    server.broadcast("/empty", "nobody home");
+    server.broadcast("/empty", std::vector<uint8_t>{0x01});
+
+    server.stop();
+}
+
+TEST(test_broadcast_different_routes) {
+    constexpr int WS_PORT = 53111;
+    Http::Server server(WS_PORT);
+
+    server.ws("/chat", {
+        .onOpen = [](Http::WebSocketHandle) {},
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+
+    server.ws("/other", {
+        .onOpen = [](Http::WebSocketHandle) {},
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+
+    server.start();
+    waitForServer(WS_PORT);
+
+    int chatSock = wsConnect(WS_PORT, "/chat");
+    int otherSock = wsConnect(WS_PORT, "/other");
+    ASSERT(chatSock >= 0 && otherSock >= 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Set a short recv timeout on otherSock so we don't block forever
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 200000;  // 200ms
+    setsockopt(otherSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    server.broadcast("/chat", "chat only");
+
+    std::string chatMsg = wsRecvFrame(chatSock);
+    ASSERT_EQ(chatMsg, std::string("chat only"));
+
+    // otherSock should NOT receive anything
+    char buf[4096];
+    ssize_t n = recv(otherSock, buf, sizeof(buf), 0);
+    ASSERT(n <= 0);
+
+    close(chatSock);
+    close(otherSock);
+    server.stop();
+}
+
+TEST(test_broadcast_pattern_match) {
+    constexpr int WS_PORT = 53112;
+    Http::Server server(WS_PORT);
+
+    server.ws("/room/:id", {
+        .onOpen = [](Http::WebSocketHandle) {},
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+
+    server.start();
+    waitForServer(WS_PORT);
+
+    int sock1 = wsConnect(WS_PORT, "/room/abc");
+    int sock2 = wsConnect(WS_PORT, "/room/xyz");
+    ASSERT(sock1 >= 0 && sock2 >= 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Broadcast using the route pattern — all connections on /room/:id receive it
+    server.broadcast("/room/:id", "to all rooms");
+
+    std::string msg1 = wsRecvFrame(sock1);
+    std::string msg2 = wsRecvFrame(sock2);
+    ASSERT_EQ(msg1, std::string("to all rooms"));
+    ASSERT_EQ(msg2, std::string("to all rooms"));
+
+    close(sock1);
+    close(sock2);
+    server.stop();
+}
+
+// ============================================================
 
 int main() {
     std::cout << "=== Unit tests ===" << std::endl;
@@ -1256,6 +1320,13 @@ int main() {
     RUN(test_ws_invalid_handle);
     RUN(test_ws_nonexistent_route_404);
     RUN(test_ws_close_connection);
+
+    std::cout << "\n=== Broadcast tests ===" << std::endl;
+    RUN(test_broadcast_text);
+    RUN(test_broadcast_binary);
+    RUN(test_broadcast_no_connections);
+    RUN(test_broadcast_different_routes);
+    RUN(test_broadcast_pattern_match);
 
     std::cout << "\n=== Results ===" << std::endl;
     std::cout << "Passed: " << passed << std::endl;

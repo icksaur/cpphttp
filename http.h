@@ -74,8 +74,8 @@ struct WebSocketHandler {
 };
 
 struct WebSocketFrame {
-    bool fin;
-    uint8_t opcode;
+    bool fin = false;
+    uint8_t opcode = 0;
     std::string payload;
 };
 
@@ -121,6 +121,8 @@ public:
     void ws(const std::string& path, WebSocketHandler handler);
     bool send(WebSocketHandle handle, const std::string& message);
     bool send(WebSocketHandle handle, const std::vector<uint8_t>& message);
+    void broadcast(const std::string& path, const std::string& message);
+    void broadcast(const std::string& path, const std::vector<uint8_t>& message);
     void closeConnection(WebSocketHandle handle);
     std::vector<std::string> getRouteVariables(WebSocketHandle handle);
 
@@ -149,6 +151,7 @@ private:
         int socket;
         std::shared_ptr<std::mutex> writeMutex;
         std::vector<std::string> routeVariables;
+        std::string routePattern;
         std::string fragmentBuffer;
         uint8_t fragmentOpcode = 0;
     };
@@ -170,7 +173,9 @@ private:
     void addRoute(const std::string& verb, const std::string& path, RouteHandler handler);
     RouteMatch findRoute(const std::string& verb, const std::string& path) const;
     NextFunction buildPipeline(RouteHandler matchedHandler, bool methodNotAllowed) const;
-    void handleWebSocketConnection(int clientSocket, const ParsedRequest& request, const WebSocketHandler& handler, const std::vector<std::string>& routeVariables);
+    std::vector<WebSocketHandle> findBroadcastTargets(const std::string& path);
+    void handleWebSocketConnection(int clientSocket, const ParsedRequest& request, const WebSocketHandler& handler, const std::vector<std::string>& routeVariables, const std::string& routePattern);
+    bool dispatchWebSocketFrame(const WebSocketFrame& frame, WebSocketHandle handle, const WebSocketHandler& handler, std::shared_ptr<std::mutex> writeMutex, int clientSocket);
 };
 
 } // namespace Http

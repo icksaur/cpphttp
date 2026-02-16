@@ -6,7 +6,7 @@ This is situational software intended only for the author's use, and does not ne
 
 ## tech
 
-- C++17
+- C++20
 - CMake
 - Linux sockets
 
