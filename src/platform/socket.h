@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <functional>
+#include <optional>
 #include <string_view>
 
 namespace Http::Platform {
@@ -35,7 +36,8 @@ NativeSocket acceptSocket(NativeSocket socket);
 NativeSocket connectLoopback(int port);
 bool setReuseAddress(NativeSocket socket);
 bool setReceiveTimeout(NativeSocket socket, std::chrono::milliseconds timeout);
-bool bindAny(NativeSocket socket, int port);
+bool bindSocket(NativeSocket socket, int port, BindAddress address);
+std::optional<int> boundPort(NativeSocket socket);
 bool listenSocket(NativeSocket socket, int backlog);
 SocketReadResult receive(NativeSocket socket, char* buffer, size_t capacity);
 void shutdownSocket(NativeSocket socket);

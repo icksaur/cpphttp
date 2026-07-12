@@ -25,6 +25,10 @@ static void createTestFiles() {
         f << "console.log('hello');";
     }
     {
+        std::ofstream f(TEST_DIR + "/module.mjs");
+        f << "export const answer = 42;";
+    }
+    {
         std::ofstream f(TEST_DIR + "/style.css");
         f << "body { color: red; }";
     }
@@ -82,6 +86,21 @@ TEST(test_fs_serve_js) {
     auto resp = httpGet(FS_PORT, "/app.js");
     ASSERT_EQ(getResponseCode(resp), 200);
     ASSERT_EQ(getResponseBody(resp), std::string("console.log('hello');"));
+    ASSERT_EQ(getContentType(resp), std::string("text/javascript"));
+
+    server.stop();
+}
+
+TEST(test_fs_serve_mjs) {
+    Http::Server server(FS_PORT);
+    Http::FileServer files(server, TEST_DIR);
+    files.add("module.mjs");
+    server.start();
+    waitForServer(FS_PORT);
+
+    auto resp = httpGet(FS_PORT, "/module.mjs");
+    ASSERT_EQ(getResponseCode(resp), 200);
+    ASSERT_EQ(getResponseBody(resp), std::string("export const answer = 42;"));
     ASSERT_EQ(getContentType(resp), std::string("text/javascript"));
 
     server.stop();
@@ -273,6 +292,7 @@ int main() {
     std::cout << "=== FileServer tests ===" << std::endl;
     RUN(test_fs_serve_html);
     RUN(test_fs_serve_js);
+    RUN(test_fs_serve_mjs);
     RUN(test_fs_serve_css);
     RUN(test_fs_serve_json);
     RUN(test_fs_serve_png);

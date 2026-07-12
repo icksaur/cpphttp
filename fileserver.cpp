@@ -14,7 +14,7 @@ std::string FileServer::contentTypeForExtension(const std::string& filename) {
 
     std::string ext = filename.substr(dot);
     if (ext == ".html") return "text/html";
-    if (ext == ".js")   return "text/javascript";
+    if (ext == ".js" || ext == ".mjs") return "text/javascript";
     if (ext == ".css")  return "text/css";
     if (ext == ".png")  return "image/png";
     if (ext == ".svg")  return "image/svg+xml";

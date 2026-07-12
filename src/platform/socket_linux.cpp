@@ -65,13 +65,25 @@ bool setReceiveTimeout(NativeSocket socket,
                         sizeof(value)) == 0;
 }
 
-bool bindAny(NativeSocket socket, int port) {
+bool bindSocket(NativeSocket socket, int port, BindAddress bindAddress) {
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_addr.s_addr = htonl(bindAddress == BindAddress::loopback
+                                        ? INADDR_LOOPBACK
+                                        : INADDR_ANY);
     address.sin_port = htons(static_cast<uint16_t>(port));
     return ::bind(fd(socket), reinterpret_cast<sockaddr*>(&address),
                   sizeof(address)) == 0;
+}
+
+std::optional<int> boundPort(NativeSocket socket) {
+    sockaddr_in address{};
+    socklen_t size = sizeof(address);
+    if (::getsockname(fd(socket), reinterpret_cast<sockaddr*>(&address),
+                      &size) != 0) {
+        return std::nullopt;
+    }
+    return ntohs(address.sin_port);
 }
 
 bool listenSocket(NativeSocket socket, int backlog) {

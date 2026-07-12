@@ -5,6 +5,16 @@
 #include <chrono>
 #include <cstring>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 // ============================================================
 // Unit tests: parsing functions
 // ============================================================
@@ -209,6 +219,118 @@ TEST(test_completeWrite_rejects_expired_deadline_without_attempt) {
 // ============================================================
 
 static const int TEST_PORT = 19876;
+
+struct NonLoopbackConnection {
+    bool addressFound = false;
+    Http::NativeSocket socket = Http::invalidSocket;
+};
+
+static NonLoopbackConnection connectNonLoopback(int port) {
+    auto probe = Http::Platform::createTcpSocket();
+    if (probe == Http::invalidSocket) return {};
+    Http::Platform::closeSocket(probe);
+
+    auto connectAddress = [port](sockaddr_in address) {
+        NonLoopbackConnection result{true, Http::Platform::createTcpSocket()};
+        if (result.socket == Http::invalidSocket) return result;
+        address.sin_port = htons(static_cast<uint16_t>(port));
+#ifdef _WIN32
+        const int connected = ::connect(
+            static_cast<SOCKET>(result.socket),
+            reinterpret_cast<sockaddr*>(&address), sizeof(address));
+        if (connected == SOCKET_ERROR) {
+#else
+        const int connected = ::connect(
+            static_cast<int>(result.socket),
+            reinterpret_cast<sockaddr*>(&address), sizeof(address));
+        if (connected < 0) {
+#endif
+            Http::Platform::closeSocket(result.socket);
+            result.socket = Http::invalidSocket;
+        }
+        return result;
+    };
+
+    char hostname[256]{};
+    addrinfo* addresses = nullptr;
+    if (::gethostname(hostname, sizeof(hostname)) == 0) {
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        ::getaddrinfo(hostname, nullptr, &hints, &addresses);
+    }
+    for (auto* entry = addresses; entry; entry = entry->ai_next) {
+        const auto address = *reinterpret_cast<sockaddr_in*>(entry->ai_addr);
+        if ((ntohl(address.sin_addr.s_addr) & 0xff000000) != 0x7f000000) {
+            const auto result = connectAddress(address);
+            ::freeaddrinfo(addresses);
+            return result;
+        }
+    }
+    if (addresses) ::freeaddrinfo(addresses);
+
+    sockaddr_in remote{};
+    remote.sin_family = AF_INET;
+    remote.sin_addr.s_addr = htonl(0xc0000201);
+    remote.sin_port = htons(9);
+    sockaddr_in local{};
+#ifdef _WIN32
+    SOCKET udp = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    int size = sizeof(local);
+    const bool routed =
+        udp != INVALID_SOCKET &&
+        ::connect(udp, reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) == 0 &&
+        ::getsockname(udp, reinterpret_cast<sockaddr*>(&local), &size) == 0;
+    if (udp != INVALID_SOCKET) ::closesocket(udp);
+#else
+    int udp = ::socket(AF_INET, SOCK_DGRAM, 0);
+    socklen_t size = sizeof(local);
+    const bool routed =
+        udp >= 0 &&
+        ::connect(udp, reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) == 0 &&
+        ::getsockname(udp, reinterpret_cast<sockaddr*>(&local), &size) == 0;
+    if (udp >= 0) ::close(udp);
+#endif
+    return routed ? connectAddress(local) : NonLoopbackConnection{};
+}
+
+TEST(test_bound_port_tracks_successful_start) {
+    Http::Server server(0, Http::BindAddress::loopback);
+    ASSERT(!server.boundPort().has_value());
+
+    server.get("/", [](Http::Context&) { return Http::Ok("loopback"); });
+    server.start();
+
+    ASSERT(server.boundPort().has_value());
+    ASSERT(*server.boundPort() > 0);
+    ASSERT_EQ(getResponseBody(httpGet(*server.boundPort(), "/")),
+              std::string("loopback"));
+    server.stop();
+    ASSERT(!server.boundPort().has_value());
+}
+
+TEST(test_loopback_server_rejects_non_loopback_connection) {
+    Http::Server server(0, Http::BindAddress::loopback);
+    server.start();
+
+    const auto connection = connectNonLoopback(*server.boundPort());
+    ASSERT(connection.addressFound);
+    ASSERT(connection.socket == Http::invalidSocket);
+    server.stop();
+}
+
+TEST(test_legacy_server_constructor_binds_any_address) {
+    Http::Server server(0);
+    server.start();
+
+    const auto connection = connectNonLoopback(*server.boundPort());
+    ASSERT(connection.addressFound);
+    ASSERT(connection.socket != Http::invalidSocket);
+    if (connection.socket != Http::invalidSocket) {
+        Http::Platform::closeSocket(connection.socket);
+    }
+    server.stop();
+}
 
 static void setupTestServer(Http::Server& server) {
     server.get("/", [](Http::Context& ctx) {
@@ -1353,6 +1475,10 @@ int main() {
     RUN(test_completeWrite_rejects_expired_deadline_without_attempt);
 
     std::cout << "\n=== Integration tests ===" << std::endl;
+    RUN(test_bound_port_tracks_successful_start);
+    RUN(test_loopback_server_rejects_non_loopback_connection);
+    RUN(test_legacy_server_constructor_binds_any_address);
+
     Http::Server server(TEST_PORT);
     setupTestServer(server);
     server.start();

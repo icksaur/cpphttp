@@ -339,7 +339,10 @@ std::string buildWebSocketFrame(uint8_t opcode, const std::string& payload) {
 
 // --- Server ---
 
-Server::Server(int port) : port_(port) {}
+Server::Server(int port) : Server(port, BindAddress::any) {}
+
+Server::Server(int port, BindAddress bindAddress)
+    : port_(port), bindAddress_(bindAddress) {}
 
 Server::~Server() {
     if (running_) {
@@ -473,6 +476,10 @@ void Server::addRoute(const std::string& verb, const std::string& path, RouteHan
     routes_.push_back({verb, normalizePath(path), std::move(handler)});
 }
 
+std::optional<int> Server::boundPort() const {
+    return boundPort_;
+}
+
 void Server::start() {
     serverSocket_ = Platform::createTcpSocket();
     if (serverSocket_ == invalidSocket) {
@@ -480,10 +487,17 @@ void Server::start() {
     }
 
     Platform::setReuseAddress(serverSocket_);
-    if (!Platform::bindAny(serverSocket_, port_)) {
+    if (!Platform::bindSocket(serverSocket_, port_, bindAddress_)) {
         Platform::closeSocket(serverSocket_);
         serverSocket_ = invalidSocket;
         throw HttpException(500, "Failed to bind to port");
+    }
+
+    const auto selectedPort = Platform::boundPort(serverSocket_);
+    if (!selectedPort) {
+        Platform::closeSocket(serverSocket_);
+        serverSocket_ = invalidSocket;
+        throw HttpException(500, "Failed to determine bound port");
     }
 
     if (!Platform::listenSocket(serverSocket_, 16)) {
@@ -494,10 +508,12 @@ void Server::start() {
 
     running_ = true;
     acceptThread_ = std::thread(&Server::acceptLoop, this);
+    boundPort_ = selectedPort;
 }
 
 void Server::stop() {
     running_ = false;
+    boundPort_.reset();
 
     // Close all WebSocket connections
     std::vector<std::pair<NativeSocket, std::shared_ptr<std::mutex>>> connections;

@@ -12,8 +12,14 @@
 #include <mutex>
 #include <memory>
 #include <limits>
+#include <optional>
 
 namespace Http {
+
+enum class BindAddress {
+    any,
+    loopback,
+};
 
 using NativeSocket = std::uintptr_t;
 inline constexpr NativeSocket invalidSocket =
@@ -146,6 +152,7 @@ std::string base64Encode(const std::string& input);
 class Server {
 public:
     explicit Server(int port);
+    Server(int port, BindAddress bindAddress);
     ~Server();
 
     void get(const std::string& path, RouteHandler handler);
@@ -169,6 +176,7 @@ public:
 
     void start();
     void stop();
+    std::optional<int> boundPort() const;
 
 private:
     struct Route {
@@ -198,6 +206,8 @@ private:
     };
 
     int port_;
+    BindAddress bindAddress_;
+    std::optional<int> boundPort_;
     NativeSocket serverSocket_ = invalidSocket;
     std::atomic<bool> running_{false};
     std::atomic<int> activeConnectionCount_{0};
