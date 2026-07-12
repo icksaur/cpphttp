@@ -53,7 +53,7 @@ The primary use case is **server→client push**: the server holds handles to co
 
 ### ownership model
 
-Server owns all WebSocket connections internally. Callbacks and external code interact via `WebSocketHandle` — a lightweight, copyable value (uint64_t). This avoids lifetime issues: callers never hold pointers or references to internal connection objects. If a handle becomes stale (client disconnected), `send()` returns false.
+Server owns all WebSocket connections internally. Callbacks and external code interact via `WebSocketHandle` — a lightweight, copyable value (uint64_t). This avoids lifetime issues: callers never hold pointers or references to internal connection objects. If a handle becomes stale, `send()` returns a typed `closed` result.
 
 ### integration with existing architecture
 
@@ -91,7 +91,7 @@ The handshake requires SHA-1 hashing and Base64 encoding. These are small, self-
 WebSocketHandle = uint64_t
   - Lightweight, copyable value identifying a connection
   - Obtained in onOpen callback, used for server→client sends
-  - Becomes invalid after onClose (send() returns false)
+  - Becomes invalid after onClose (`send()` returns typed `closed`)
 
 WebSocketMessage
   - opcode (uint8_t) — 0x1 text, 0x2 binary
@@ -141,7 +141,9 @@ while (running) {
     auto data = getLatestData();
     std::lock_guard lock(clientsMutex);
     for (auto handle : clients) {
-        http.send(handle, data);  // returns false if connection gone
+        if (!http.send(handle, data)) {
+            // Connection is gone or the write did not complete.
+        }
     }
 }
 ```
@@ -193,13 +195,18 @@ http.ws("/echo", {
 
 ```
 ws(path, WebSocketHandler) — register WebSocket route
-send(handle, string) → bool — send text message, returns false if handle invalid
-send(handle, vector<uint8_t>) → bool — send binary message, returns false if handle invalid
+send(handle, string[, deadline]) → SocketWriteResult — complete text-frame write
+send(handle, vector<uint8_t>[, deadline]) → SocketWriteResult — complete binary-frame write
 closeConnection(handle) → void — server-initiated close (sends close frame)
 getRouteVariables(handle) → vector<string> — route variables captured at handshake
 ```
 
-`send()` returns bool rather than throwing: a closed connection is expected behavior (clients disconnect), not exceptional. Consistent with code-quality.md ("simple is best", avoid side effects). Caller can check return value and clean up stale handles, or ignore it.
+`send()` returns `SocketWriteResult` rather than throwing: a closed connection
+is expected behavior, not exceptional. The result distinguishes `complete`,
+`timeout`, `closed`, and `error`, reports transferred bytes and the native error
+code, and remains condition-testable for existing `if (send(...))` call sites.
+The deadline overload takes an absolute `steady_clock` time point; the simpler
+overload applies the server's finite write budget.
 
 ### route matching
 
@@ -224,13 +231,15 @@ WebSocket routes use the same `matchRoute` and path variable system as HTTP rout
 | Masking bugs corrupt data | Unit test with known masked/unmasked frame pairs |
 | `stop()` hangs waiting for slow WS clients | Close timeout — force-close socket after 5 seconds if close handshake doesn't complete |
 | Thread safety of `send()` from multiple threads | Two-level locking: registry mutex for lookup only, per-connection write mutex for I/O (see locking protocol in decisions) |
-| Stale handles used after onClose | `send()` returns false; handle lookup fails cleanly |
+| Stale handles used after onClose | `send()` returns typed `closed`; handle lookup fails cleanly |
 | Fragmented message exceeds max size | Track assembled size; close connection if it exceeds 1MB |
 
 ## decisions
 
 - **Handle-based API** — Server owns connections internally; callers hold `WebSocketHandle` (uint64_t). Avoids lifetime/ownership issues. Handles are comparable, copyable, and storable in any container.
-- **`send()` returns bool** — closed connections are expected, not exceptional. Returning false is simple and lets callers decide how to react. No exception overhead for normal disconnects.
+- **`send()` returns a typed result** — closed connections are expected, not
+  exceptional, while callers that need to distinguish timeout from transport
+  error retain actionable detail.
 - **`send()` on Server, not on connection object** — Server owns the socket, the mutex, the registry. Centralizes thread safety. Callers don't need to worry about connection object lifetime.
 - **onClose receives handle** — callers need the handle to remove it from their tracking structures (vectors, maps, sets).
 - **`getRouteVariables(handle)`** — route variables set once at handshake, immutable for connection lifetime. Accessed via Server method since Server owns the data.
@@ -261,8 +270,8 @@ Add `WebSocketHandle` alias, `WebSocketMessage`, `WebSocketHandler` (with onOpen
 
 Add to Server class:
 - `ws(const std::string& path, WebSocketHandler handler)` — register WS route
-- `bool send(WebSocketHandle handle, const std::string& message)` — send text
-- `bool send(WebSocketHandle handle, const std::vector<uint8_t>& message)` — send binary
+- `SocketWriteResult send(WebSocketHandle handle, const std::string& message[, deadline])` — send text
+- `SocketWriteResult send(WebSocketHandle handle, const std::vector<uint8_t>& message[, deadline])` — send binary
 - `void closeConnection(WebSocketHandle handle)` — server-initiated close
 - `std::vector<std::string> getRouteVariables(WebSocketHandle handle)` — access route vars
 
@@ -284,7 +293,10 @@ Implement `isWebSocketUpgrade` — checks for `Upgrade: websocket` header and `C
 
 ### 6. Implement Server::send, closeConnection, getRouteVariables
 
-`send()` — lock registry mutex, look up handle, copy socket fd and shared_ptr to write mutex, unlock registry mutex. Lock write mutex, build frame, write to socket, unlock write mutex. Return false if handle not found. Never hold registry mutex during I/O.
+`send()` — lock registry mutex, look up handle, copy the native socket and
+shared write mutex, unlock registry mutex. Lock the write mutex, build the
+frame, and use the platform seam's deadline-aware complete write. Return
+`closed` if the handle is absent. Never hold the registry mutex during I/O.
 
 `closeConnection()` — same locking protocol as `send()`: look up under registry lock, copy fd + write mutex, release registry lock, then lock write mutex and send close frame.
 
@@ -333,7 +345,8 @@ Add WebSocket tests to tests/test_http.cpp:
 - Ping/pong
 - Client-initiated close handshake
 - Server-initiated close via `http.closeConnection(handle)`
-- `http.send()` returns false for invalid/stale handle
+- `http.send()` returns typed `closed` for an invalid/stale handle and typed
+  `timeout` for an expired deadline
 - Server stop closes WebSocket connections
 - WebSocket route with path variables, verify `getRouteVariables()`
 - Non-WebSocket GET to a WS-only route returns 404

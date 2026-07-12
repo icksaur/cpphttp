@@ -4,10 +4,7 @@
 #include <string>
 #include <thread>
 #include <chrono>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
+#include "src/platform/socket.h"
 
 static int passed = 0;
 static int failed = 0;
@@ -37,28 +34,38 @@ static int failed = 0;
     name(); \
 } while(0)
 
+static std::ptrdiff_t send(Http::NativeSocket socket, const char* data,
+                           size_t size, int) {
+    const auto result = Http::Platform::writeComplete(
+        socket, std::string_view(data, size),
+        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    return result ? static_cast<std::ptrdiff_t>(result.bytesTransferred) : -1;
+}
+
+static std::ptrdiff_t recv(Http::NativeSocket socket, char* buffer,
+                           size_t capacity, int) {
+    const auto result = Http::Platform::receive(socket, buffer, capacity);
+    return result.status == Http::Platform::SocketReadStatus::data
+               ? static_cast<std::ptrdiff_t>(result.bytesTransferred)
+               : -1;
+}
+
+static void close(Http::NativeSocket socket) {
+    Http::Platform::closeSocket(socket);
+}
+
 // --- Helper: send raw HTTP request and get response ---
 
 static std::string sendRequest(int port, const std::string& raw) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return "";
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
-    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        close(sock);
-        return "";
-    }
+    auto sock = Http::Platform::connectLoopback(port);
+    if (sock == Http::invalidSocket) return "";
 
     send(sock, raw.c_str(), raw.size(), 0);
 
     std::string response;
     char buf[4096];
     while (true) {
-        ssize_t n = recv(sock, buf, sizeof(buf), 0);
+        std::ptrdiff_t n = recv(sock, buf, sizeof(buf), 0);
         if (n <= 0) break;
         response.append(buf, n);
     }
@@ -105,20 +112,12 @@ static std::string getContentType(const std::string& raw) {
 
 static void waitForServer(int port, int maxRetries = 50) {
     for (int i = 0; i < maxRetries; i++) {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) {
+        auto sock = Http::Platform::connectLoopback(port);
+        if (sock == Http::invalidSocket) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-        if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
-            close(sock);
-            return;
-        }
         close(sock);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        return;
     }
 }

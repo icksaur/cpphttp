@@ -4,14 +4,51 @@
 #include <vector>
 #include <functional>
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <stdexcept>
 #include <cstdint>
 #include <unordered_map>
 #include <mutex>
 #include <memory>
+#include <limits>
 
 namespace Http {
+
+using NativeSocket = std::uintptr_t;
+inline constexpr NativeSocket invalidSocket =
+    std::numeric_limits<NativeSocket>::max();
+
+enum class SocketWriteStatus {
+    complete,
+    timeout,
+    closed,
+    error,
+};
+
+struct SocketWriteResult {
+    SocketWriteStatus status = SocketWriteStatus::error;
+    size_t bytesTransferred = 0;
+    int nativeError = 0;
+
+    static SocketWriteResult complete(size_t bytes) {
+        return {SocketWriteStatus::complete, bytes, 0};
+    }
+    static SocketWriteResult timeout(size_t bytes = 0, int error = 0) {
+        return {SocketWriteStatus::timeout, bytes, error};
+    }
+    static SocketWriteResult closed(int error = 0, size_t bytes = 0) {
+        return {SocketWriteStatus::closed, bytes, error};
+    }
+    static SocketWriteResult error(int error, size_t bytes = 0) {
+        return {SocketWriteStatus::error, bytes, error};
+    }
+    explicit operator bool() const {
+        return status == SocketWriteStatus::complete;
+    }
+};
+
+using SocketWriteDeadline = std::chrono::steady_clock::time_point;
 
 // --- Data types ---
 
@@ -119,8 +156,12 @@ public:
     void addStage(StageHandler handler);
 
     void ws(const std::string& path, WebSocketHandler handler);
-    bool send(WebSocketHandle handle, const std::string& message);
-    bool send(WebSocketHandle handle, const std::vector<uint8_t>& message);
+    SocketWriteResult send(WebSocketHandle handle, const std::string& message);
+    SocketWriteResult send(WebSocketHandle handle, const std::string& message,
+                           SocketWriteDeadline deadline);
+    SocketWriteResult send(WebSocketHandle handle, const std::vector<uint8_t>& message);
+    SocketWriteResult send(WebSocketHandle handle, const std::vector<uint8_t>& message,
+                           SocketWriteDeadline deadline);
     void broadcast(const std::string& path, const std::string& message);
     void broadcast(const std::string& path, const std::vector<uint8_t>& message);
     void closeConnection(WebSocketHandle handle);
@@ -148,7 +189,7 @@ private:
     };
 
     struct WebSocketConnectionInfo {
-        int socket;
+        NativeSocket socket;
         std::shared_ptr<std::mutex> writeMutex;
         std::vector<std::string> routeVariables;
         std::string routePattern;
@@ -157,7 +198,7 @@ private:
     };
 
     int port_;
-    int serverSocket_ = -1;
+    NativeSocket serverSocket_ = invalidSocket;
     std::atomic<bool> running_{false};
     std::atomic<int> activeConnectionCount_{0};
     std::thread acceptThread_;
@@ -169,13 +210,13 @@ private:
     std::atomic<WebSocketHandle> nextWsHandle_{1};
 
     void acceptLoop();
-    void handleConnection(int clientSocket);
+    void handleConnection(NativeSocket clientSocket);
     void addRoute(const std::string& verb, const std::string& path, RouteHandler handler);
     RouteMatch findRoute(const std::string& verb, const std::string& path) const;
     NextFunction buildPipeline(RouteHandler matchedHandler, bool methodNotAllowed) const;
     std::vector<WebSocketHandle> findBroadcastTargets(const std::string& path);
-    void handleWebSocketConnection(int clientSocket, const ParsedRequest& request, const WebSocketHandler& handler, const std::vector<std::string>& routeVariables, const std::string& routePattern);
-    bool dispatchWebSocketFrame(const WebSocketFrame& frame, WebSocketHandle handle, const WebSocketHandler& handler, std::shared_ptr<std::mutex> writeMutex, int clientSocket);
+    void handleWebSocketConnection(NativeSocket clientSocket, const ParsedRequest& request, const WebSocketHandler& handler, const std::vector<std::string>& routeVariables, const std::string& routePattern);
+    bool dispatchWebSocketFrame(const WebSocketFrame& frame, WebSocketHandle handle, const WebSocketHandler& handler, std::shared_ptr<std::mutex> writeMutex, NativeSocket clientSocket);
 };
 
 } // namespace Http

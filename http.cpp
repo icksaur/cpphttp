@@ -1,25 +1,27 @@
 #include "http.h"
+#include "src/platform/socket.h"
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
 #include <cstring>
-#include <sys/time.h>
 #include <algorithm>
 #include <limits>
-#include <format>
 
 namespace Http {
 
 // --- RAII socket closer ---
 
 struct SocketGuard {
-    int fd;
-    explicit SocketGuard(int socket) : fd(socket) {}
-    ~SocketGuard() { if (fd >= 0) close(fd); }
+    NativeSocket socket;
+    explicit SocketGuard(NativeSocket socket) : socket(socket) {}
+    ~SocketGuard() { Platform::closeSocket(socket); }
     SocketGuard(const SocketGuard&) = delete;
     SocketGuard& operator=(const SocketGuard&) = delete;
 };
+
+static constexpr auto WRITE_TIMEOUT = std::chrono::seconds(5);
+
+static SocketWriteDeadline defaultWriteDeadline() {
+    return std::chrono::steady_clock::now() + WRITE_TIMEOUT;
+}
 
 // --- HttpException ---
 
@@ -175,9 +177,10 @@ std::string formatResponse(int statusCode, const std::string& body, const std::s
         default:  statusText = "Unknown"; break;
     }
 
-    return std::format(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        statusCode, statusText, contentType, body.size(), body);
+    return "HTTP/1.1 " + std::to_string(statusCode) + " " + statusText +
+           "\r\nContent-Type: " + contentType + "\r\nContent-Length: " +
+           std::to_string(body.size()) +
+           "\r\nConnection: close\r\n\r\n" + body;
 }
 
 // --- SHA-1 and Base64 ---
@@ -372,55 +375,67 @@ void Server::ws(const std::string& path, WebSocketHandler handler) {
     wsRoutes_.push_back({normalizePath(path), std::move(handler)});
 }
 
-bool Server::send(WebSocketHandle handle, const std::string& message) {
-    int sock;
+SocketWriteResult Server::send(WebSocketHandle handle,
+                               const std::string& message) {
+    return send(handle, message, defaultWriteDeadline());
+}
+
+SocketWriteResult Server::send(WebSocketHandle handle,
+                               const std::string& message,
+                               SocketWriteDeadline deadline) {
+    NativeSocket socket;
     std::shared_ptr<std::mutex> writeMutex;
     {
         std::lock_guard lock(wsConnectionsMutex_);
         auto it = wsConnections_.find(handle);
-        if (it == wsConnections_.end()) return false;
-        sock = it->second.socket;
+        if (it == wsConnections_.end()) return SocketWriteResult::closed();
+        socket = it->second.socket;
         writeMutex = it->second.writeMutex;
     }
 
     std::lock_guard writeLock(*writeMutex);
-    std::string frame = buildWebSocketFrame(0x1, message);  // text frame
-    ssize_t sent = ::send(sock, frame.c_str(), frame.size(), 0);
-    return sent == static_cast<ssize_t>(frame.size());
+    const std::string frame = buildWebSocketFrame(0x1, message);
+    return Platform::writeComplete(socket, frame, deadline);
 }
 
-bool Server::send(WebSocketHandle handle, const std::vector<uint8_t>& message) {
-    int sock;
+SocketWriteResult Server::send(WebSocketHandle handle,
+                               const std::vector<uint8_t>& message) {
+    return send(handle, message, defaultWriteDeadline());
+}
+
+SocketWriteResult Server::send(WebSocketHandle handle,
+                               const std::vector<uint8_t>& message,
+                               SocketWriteDeadline deadline) {
+    NativeSocket socket;
     std::shared_ptr<std::mutex> writeMutex;
     {
         std::lock_guard lock(wsConnectionsMutex_);
         auto it = wsConnections_.find(handle);
-        if (it == wsConnections_.end()) return false;
-        sock = it->second.socket;
+        if (it == wsConnections_.end()) return SocketWriteResult::closed();
+        socket = it->second.socket;
         writeMutex = it->second.writeMutex;
     }
 
     std::lock_guard writeLock(*writeMutex);
     std::string payload(message.begin(), message.end());
-    std::string frame = buildWebSocketFrame(0x2, payload);  // binary frame
-    ssize_t sent = ::send(sock, frame.c_str(), frame.size(), 0);
-    return sent == static_cast<ssize_t>(frame.size());
+    const std::string frame = buildWebSocketFrame(0x2, payload);
+    return Platform::writeComplete(socket, frame, deadline);
 }
 
 void Server::closeConnection(WebSocketHandle handle) {
-    int sock;
+    NativeSocket socket;
     std::shared_ptr<std::mutex> writeMutex;
     {
         std::lock_guard lock(wsConnectionsMutex_);
         auto it = wsConnections_.find(handle);
         if (it == wsConnections_.end()) return;
-        sock = it->second.socket;
+        socket = it->second.socket;
         writeMutex = it->second.writeMutex;
     }
 
     std::lock_guard writeLock(*writeMutex);
-    std::string closeFrame = buildWebSocketFrame(0x8, "");  // close frame
-    ::send(sock, closeFrame.c_str(), closeFrame.size(), 0);
+    const std::string closeFrame = buildWebSocketFrame(0x8, "");
+    Platform::writeComplete(socket, closeFrame, defaultWriteDeadline());
 }
 
 std::vector<std::string> Server::getRouteVariables(WebSocketHandle handle) {
@@ -459,28 +474,21 @@ void Server::addRoute(const std::string& verb, const std::string& path, RouteHan
 }
 
 void Server::start() {
-    serverSocket_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSocket_ < 0) {
+    serverSocket_ = Platform::createTcpSocket();
+    if (serverSocket_ == invalidSocket) {
         throw HttpException(500, "Failed to create socket");
     }
 
-    int opt = 1;
-    setsockopt(serverSocket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port_);
-
-    if (bind(serverSocket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        close(serverSocket_);
-        serverSocket_ = -1;
+    Platform::setReuseAddress(serverSocket_);
+    if (!Platform::bindAny(serverSocket_, port_)) {
+        Platform::closeSocket(serverSocket_);
+        serverSocket_ = invalidSocket;
         throw HttpException(500, "Failed to bind to port");
     }
 
-    if (listen(serverSocket_, 16) < 0) {
-        close(serverSocket_);
-        serverSocket_ = -1;
+    if (!Platform::listenSocket(serverSocket_, 16)) {
+        Platform::closeSocket(serverSocket_);
+        serverSocket_ = invalidSocket;
         throw HttpException(500, "Failed to listen");
     }
 
@@ -492,7 +500,7 @@ void Server::stop() {
     running_ = false;
 
     // Close all WebSocket connections
-    std::vector<std::pair<int, std::shared_ptr<std::mutex>>> connections;
+    std::vector<std::pair<NativeSocket, std::shared_ptr<std::mutex>>> connections;
     {
         std::lock_guard lock(wsConnectionsMutex_);
         for (auto& [handle, conn] : wsConnections_) {
@@ -501,17 +509,17 @@ void Server::stop() {
     }
     
     // Send close frames without holding registry mutex
-    for (auto& [sock, writeMutex] : connections) {
+    for (auto& [socket, writeMutex] : connections) {
         std::lock_guard writeLock(*writeMutex);
-        std::string closeFrame = buildWebSocketFrame(0x8, "");
-        ::send(sock, closeFrame.c_str(), closeFrame.size(), 0);
-        shutdown(sock, SHUT_RDWR);
+        const std::string closeFrame = buildWebSocketFrame(0x8, "");
+        Platform::writeComplete(socket, closeFrame, defaultWriteDeadline());
+        Platform::shutdownSocket(socket);
     }
 
-    if (serverSocket_ >= 0) {
-        shutdown(serverSocket_, SHUT_RDWR);
-        close(serverSocket_);
-        serverSocket_ = -1;
+    if (serverSocket_ != invalidSocket) {
+        Platform::shutdownSocket(serverSocket_);
+        Platform::closeSocket(serverSocket_);
+        serverSocket_ = invalidSocket;
     }
     if (acceptThread_.joinable()) {
         acceptThread_.join();
@@ -523,11 +531,9 @@ void Server::stop() {
 
 void Server::acceptLoop() {
     while (running_) {
-        sockaddr_in clientAddr{};
-        socklen_t clientLen = sizeof(clientAddr);
-        int clientSocket = accept(serverSocket_, reinterpret_cast<sockaddr*>(&clientAddr), &clientLen);
+        NativeSocket clientSocket = Platform::acceptSocket(serverSocket_);
 
-        if (clientSocket < 0) {
+        if (clientSocket == invalidSocket) {
             continue;
         }
 
@@ -561,14 +567,14 @@ static size_t extractContentLength(const std::string& rawHeaders) {
     }
 }
 
-static std::string readFullRequest(int clientSocket) {
+static std::string readFullRequest(NativeSocket clientSocket) {
     std::string raw;
     char buffer[4096];
 
     while (true) {
-        ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer), 0);
-        if (bytesRead <= 0) return "";
-        raw.append(buffer, bytesRead);
+        const auto read = Platform::receive(clientSocket, buffer, sizeof(buffer));
+        if (read.status != Platform::SocketReadStatus::data) return "";
+        raw.append(buffer, read.bytesTransferred);
         if (raw.size() > MAX_REQUEST_SIZE) return "";
         if (raw.find("\r\n\r\n") != std::string::npos) break;
     }
@@ -579,10 +585,10 @@ static std::string readFullRequest(int clientSocket) {
     size_t bodyReceived = raw.size() - (headerEnd + 4);
     while (bodyReceived < contentLength) {
         if (raw.size() > MAX_REQUEST_SIZE) return "";
-        ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer), 0);
-        if (bytesRead <= 0) break;
-        raw.append(buffer, bytesRead);
-        bodyReceived += bytesRead;
+        const auto read = Platform::receive(clientSocket, buffer, sizeof(buffer));
+        if (read.status != Platform::SocketReadStatus::data) break;
+        raw.append(buffer, read.bytesTransferred);
+        bodyReceived += read.bytesTransferred;
     }
 
     return raw;
@@ -643,13 +649,10 @@ NextFunction Server::buildPipeline(RouteHandler matchedHandler, bool methodNotAl
     return pipeline;
 }
 
-void Server::handleConnection(int clientSocket) {
+void Server::handleConnection(NativeSocket clientSocket) {
     SocketGuard guard(clientSocket);
     
-    struct timeval tv;
-    tv.tv_sec = 5;
-    tv.tv_usec = 0;
-    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    Platform::setReceiveTimeout(clientSocket, std::chrono::seconds(5));
 
     std::string rawRequest = readFullRequest(clientSocket);
     if (rawRequest.empty()) {
@@ -691,24 +694,26 @@ void Server::handleConnection(int clientSocket) {
     }
 
     std::string response = formatResponse(ctx.response.statusCode, ctx.response.body, ctx.response.contentType);
-    ::send(clientSocket, response.c_str(), response.size(), 0);
+    Platform::writeComplete(clientSocket, response, defaultWriteDeadline());
 }
 
 bool Server::dispatchWebSocketFrame(const WebSocketFrame& frame, WebSocketHandle handle, 
                                      const WebSocketHandler& handler, 
                                      std::shared_ptr<std::mutex> writeMutex, 
-                                     int clientSocket) {
+                                     NativeSocket clientSocket) {
     static constexpr size_t MAX_MESSAGE_SIZE = 1024 * 1024;
     
     if (frame.opcode == 0x8) {  // Close
         std::lock_guard writeLock(*writeMutex);
         std::string closeFrame = buildWebSocketFrame(0x8, "");
-        ::send(clientSocket, closeFrame.c_str(), closeFrame.size(), 0);
+        Platform::writeComplete(clientSocket, closeFrame,
+                                defaultWriteDeadline());
         return true;  // Signal to exit loop
     } else if (frame.opcode == 0x9) {  // Ping
         std::lock_guard writeLock(*writeMutex);
         std::string pongFrame = buildWebSocketFrame(0xA, frame.payload);
-        ::send(clientSocket, pongFrame.c_str(), pongFrame.size(), 0);
+        Platform::writeComplete(clientSocket, pongFrame,
+                                defaultWriteDeadline());
     } else if (frame.opcode == 0x1 || frame.opcode == 0x2) {  // Text or Binary
         if (frame.fin) {
             // Complete message
@@ -750,15 +755,12 @@ bool Server::dispatchWebSocketFrame(const WebSocketFrame& frame, WebSocketHandle
     return false;  // Continue loop
 }
 
-void Server::handleWebSocketConnection(int clientSocket, const ParsedRequest& request, 
+void Server::handleWebSocketConnection(NativeSocket clientSocket, const ParsedRequest& request,
                                         const WebSocketHandler& handler,
                                         const std::vector<std::string>& routeVariables,
                                         const std::string& routePattern) {
     // Set longer timeout for WebSocket connections (60 seconds instead of 5)
-    struct timeval tv;
-    tv.tv_sec = 60;
-    tv.tv_usec = 0;
-    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    Platform::setReceiveTimeout(clientSocket, std::chrono::seconds(60));
     
     // Extract WebSocket key
     std::string clientKey;
@@ -783,7 +785,8 @@ void Server::handleWebSocketConnection(int clientSocket, const ParsedRequest& re
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n";
     
-    if (::send(clientSocket, handshake.c_str(), handshake.size(), 0) < 0) {
+    if (!Platform::writeComplete(clientSocket, handshake,
+                                 defaultWriteDeadline())) {
         return;
     }
 
@@ -815,10 +818,10 @@ void Server::handleWebSocketConnection(int clientSocket, const ParsedRequest& re
     bool done = false;
 
     while (running_ && !done) {
-        ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer), 0);
-        if (bytesRead <= 0) break;
+        const auto read = Platform::receive(clientSocket, buffer, sizeof(buffer));
+        if (read.status != Platform::SocketReadStatus::data) break;
 
-        recvBuffer.append(buffer, bytesRead);
+        recvBuffer.append(buffer, read.bytesTransferred);
 
         while (recvBuffer.size() >= 2) {
             // Parse frame

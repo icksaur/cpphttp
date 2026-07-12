@@ -2,7 +2,6 @@
 #include "test_helpers.h"
 
 #include <fstream>
-#include <sys/stat.h>
 #include <filesystem>
 
 // --- Test fixture: create/clean temp files ---
@@ -15,7 +14,7 @@ static void cleanTestFiles() {
 
 static void createTestFiles() {
     cleanTestFiles();
-    mkdir(TEST_DIR.c_str(), 0755);
+    std::filesystem::create_directories(TEST_DIR);
 
     {
         std::ofstream f(TEST_DIR + "/index.html");

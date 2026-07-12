@@ -232,8 +232,8 @@ http.ws("/chat/:room", {
 
 **Server methods:**
 - `ws(path, handler)` — register WebSocket route
-- `send(handle, string)` → bool — send text message, returns false if connection closed
-- `send(handle, vector<uint8_t>)` → bool — send binary message
+- `send(handle, string[, deadline])` → `SocketWriteResult` — complete text-frame write
+- `send(handle, vector<uint8_t>[, deadline])` → `SocketWriteResult` — complete binary-frame write
 - `closeConnection(handle)` — server-initiated close
 - `getRouteVariables(handle)` → vector<string> — route variables captured at handshake
 
@@ -243,3 +243,4 @@ http.ws("/chat/:room", {
 - Fragmented message reassembly
 - Automatic ping/pong handling
 - Clean shutdown integration
+- Typed `complete`, `timeout`, `closed`, and `error` write outcomes

@@ -13,7 +13,7 @@ Binary and text request/response capability
 one function per verb in library
 addStage for "middleware"
 colon-prepended slug-format path variables - see README
-C++20, CMake, Linux sockets
+C++20, CMake, Linux and Windows sockets
 
 ## implementation
 
@@ -47,8 +47,8 @@ All types must be value-initialized. Structs returned from parsing functions mus
 - `get/post/put/patch/del` - one function per verb, registers route handler
 - `addStage` - registers middleware stage
 - `ws(path, WebSocketHandler)` - registers WebSocket route
-- `send(handle, string) → bool` - send text message to WebSocket client, returns false if handle invalid
-- `send(handle, vector<uint8_t>) → bool` - send binary message, returns false if handle invalid
+- `send(handle, string[, deadline]) → SocketWriteResult` - deadline-aware complete text-frame write
+- `send(handle, vector<uint8_t>[, deadline]) → SocketWriteResult` - deadline-aware complete binary-frame write
 - `broadcast(path, string)` - send text message to all WebSocket connections whose route pattern matches `path`
 - `broadcast(path, vector<uint8_t>)` - binary broadcast overload
 - `closeConnection(handle)` - server-initiated WebSocket close
@@ -120,7 +120,8 @@ Behavior:
 
 - Server owns all connections via internal registry (unordered_map<WebSocketHandle, ConnectionInfo>)
 - Callers hold WebSocketHandle (uint64_t) — lightweight, copyable, no lifetime concerns
-- `send()` returns bool (false if handle stale) — disconnects are expected, not exceptional
+- `send()` returns a typed result; stale or disconnected handles report
+  `closed` rather than throwing because disconnects are expected
 - `getRouteVariables(handle)` returns route variables captured at handshake time
 
 ### broadcast
@@ -149,7 +150,12 @@ Behavior:
 - Connection: close on every response (no keep-alive)
 - **Socket cleanup via RAII** — `handleConnection` uses a `SocketGuard` (destructor calls `close(fd)`). No manual `close(clientSocket)` calls. Socket is closed before `activeConnectionCount_` is decremented (SocketGuard destructs before the detached thread's decrement runs).
 - **Handle-based WebSocket API** — Server owns connections internally; callers hold `WebSocketHandle` (uint64_t)
-- **`send()` returns bool** — closed connections are expected, not exceptional
+- **`send()` returns `SocketWriteResult`** — status is `complete`, `timeout`,
+  `closed`, or `error`; it also carries bytes written and a native error code.
+  The no-deadline overload uses a finite server write budget.
+- **Compatibility is condition-based** — `SocketWriteResult` has an explicit
+  truth conversion that is true only for `complete`, preserving existing
+  `if (server.send(...))` call sites without discarding typed detail.
 - **`send()` on Server, not on connection object** — Server owns the socket, the mutex, the registry. Centralizes thread safety.
 - **Two-level locking protocol** — Registry mutex held only for lookups, never during I/O. To write: (1) lock registry, (2) copy fd + shared_ptr<mutex>, (3) unlock registry, (4) lock write mutex, (5) write, (6) unlock write mutex. All socket write paths follow this: `send()`, `closeConnection()`, `stop()`, and message loop pong/close responses.
 - **Fragmented message reassembly** — frames arrive in TCP order. Accumulate until fin=1. Max assembled size 1MB.
@@ -162,7 +168,17 @@ Behavior:
 
 ### socket handling
 
-- Linux sockets: socket, bind, listen, accept, recv, send, close
+- `src/platform/socket.*` is the only owner of native socket types, startup,
+  close/shutdown, options, bind/listen/accept, receive, and write operations.
+- Linux uses POSIX sockets and suppresses `SIGPIPE` on writes. Windows owns
+  balanced Winsock startup/cleanup and uses `closesocket`, `SD_BOTH`, and
+  `WSAGetLastError`.
+- A complete write accepts an absolute
+  `std::chrono::steady_clock::time_point`, loops over partial sends, and stops
+  with typed `complete`, `timeout`, `closed`, or `error` status. The result
+  includes bytes transferred and the native error code when applicable.
+- HTTP responses, WebSocket upgrades, data frames, pong frames, and close
+  frames all use the complete-write operation.
 - SO_REUSEADDR for quick restart
 - Accept loop in dedicated thread
 - Each connection handled in detached thread with atomic connection counter
@@ -172,6 +188,18 @@ Behavior:
 - Max request size enforced (1MB) — drops oversized requests
 - Connection: close after each response
 - 405 returned when path matches but verb doesn't
+
+### cross-platform transport oracle
+
+Implementation is ordered: first extract the Linux socket seam with the
+existing suite unchanged, then add the typed complete-write algorithm, then add
+the Windows backend. A scripted write-attempt seam deterministically supplies
+partial, timeout, closed, and error results and verifies byte accounting and
+deadline termination independently of kernel buffer timing. Native loopback
+tests cover HTTP/WebSocket frames, close, and server connection lifecycle using
+the same script on both platforms. Local validation runs Linux tests and, when
+already installed, a MinGW source/build check. Native Windows CI is the
+authoritative runtime parity gate; Wine is not used.
 
 ## File server (fileserver.h / fileserver.cpp)
 

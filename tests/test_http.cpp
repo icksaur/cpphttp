@@ -1,6 +1,8 @@
 #include "http.h"
+#include "src/platform/socket.h"
 #include "test_helpers.h"
 
+#include <chrono>
 #include <cstring>
 
 // ============================================================
@@ -130,6 +132,76 @@ TEST(test_formatResponse_404) {
     auto resp = Http::formatResponse(404, "nope", "text/plain");
     ASSERT(resp.find("HTTP/1.1 404 Not Found") != std::string::npos);
     ASSERT(resp.find("nope") != std::string::npos);
+}
+
+TEST(test_completeWrite_retries_partial_attempts) {
+    std::string received;
+    int attempts = 0;
+    const auto result = Http::Platform::completeWrite(
+        "partial-write",
+        std::chrono::steady_clock::now() + std::chrono::seconds(1),
+        [&](std::string_view remaining, std::chrono::milliseconds) {
+            const size_t chunk = std::min<size_t>(remaining.size(), attempts++ + 1);
+            received.append(remaining.substr(0, chunk));
+            return Http::SocketWriteResult::complete(chunk);
+        });
+
+    ASSERT(result);
+    ASSERT_EQ(result.bytesTransferred, size_t{13});
+    ASSERT(attempts > 1);
+    ASSERT_EQ(received, std::string("partial-write"));
+}
+
+TEST(test_completeWrite_reports_timeout_after_partial_progress) {
+    int attempts = 0;
+    const auto result = Http::Platform::completeWrite(
+        "payload",
+        std::chrono::steady_clock::now() + std::chrono::seconds(1),
+        [&](std::string_view, std::chrono::milliseconds) {
+            if (attempts++ == 0) {
+                return Http::SocketWriteResult::complete(2);
+            }
+            return Http::SocketWriteResult::timeout();
+        });
+
+    ASSERT(result.status == Http::SocketWriteStatus::timeout);
+    ASSERT_EQ(result.bytesTransferred, size_t{2});
+    ASSERT_EQ(result.nativeError, 0);
+}
+
+TEST(test_completeWrite_reports_closed_and_error) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const auto closed = Http::Platform::completeWrite(
+        "payload", deadline,
+        [](std::string_view, std::chrono::milliseconds) {
+            return Http::SocketWriteResult::closed(32);
+        });
+    const auto error = Http::Platform::completeWrite(
+        "payload", deadline,
+        [](std::string_view, std::chrono::milliseconds) {
+            return Http::SocketWriteResult::error(5);
+        });
+
+    ASSERT(closed.status == Http::SocketWriteStatus::closed);
+    ASSERT_EQ(closed.nativeError, 32);
+    ASSERT(error.status == Http::SocketWriteStatus::error);
+    ASSERT_EQ(error.nativeError, 5);
+}
+
+TEST(test_completeWrite_rejects_expired_deadline_without_attempt) {
+    bool attempted = false;
+    const auto result = Http::Platform::completeWrite(
+        "payload",
+        std::chrono::steady_clock::now() - std::chrono::milliseconds(1),
+        [&](std::string_view, std::chrono::milliseconds) {
+            attempted = true;
+            return Http::SocketWriteResult::complete(7);
+        });
+
+    ASSERT(result.status == Http::SocketWriteStatus::timeout);
+    ASSERT_EQ(result.bytesTransferred, size_t{0});
+    ASSERT(!attempted);
 }
 
 // ============================================================
@@ -703,18 +775,8 @@ TEST(test_parseWebSocketFrame_126_length) {
 // ============================================================
 
 static std::string wsHandshake(int port, const std::string& path, const std::string& clientKey) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return "";
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
-    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        close(sock);
-        return "";
-    }
+    auto sock = Http::Platform::connectLoopback(port);
+    if (sock == Http::invalidSocket) return "";
 
     std::string req = "GET " + path + " HTTP/1.1\r\n"
                       "Host: localhost\r\n"
@@ -726,7 +788,7 @@ static std::string wsHandshake(int port, const std::string& path, const std::str
 
     std::string response;
     char buf[4096];
-    ssize_t n = recv(sock, buf, sizeof(buf), 0);
+    std::ptrdiff_t n = recv(sock, buf, sizeof(buf), 0);
     if (n > 0) {
         response.append(buf, n);
     }
@@ -735,19 +797,9 @@ static std::string wsHandshake(int port, const std::string& path, const std::str
     return response;
 }
 
-static int wsConnect(int port, const std::string& path) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return -1;
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
-    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        close(sock);
-        return -1;
-    }
+static Http::NativeSocket wsConnect(int port, const std::string& path) {
+    auto sock = Http::Platform::connectLoopback(port);
+    if (sock == Http::invalidSocket) return Http::invalidSocket;
 
     std::string clientKey = "dGhlIHNhbXBsZSBub25jZQ==";
     std::string req = "GET " + path + " HTTP/1.1\r\n"
@@ -758,14 +810,20 @@ static int wsConnect(int port, const std::string& path) {
                       "Sec-WebSocket-Version: 13\r\n\r\n";
     send(sock, req.c_str(), req.size(), 0);
 
-    // Read handshake response
-    char buf[4096];
-    recv(sock, buf, sizeof(buf), 0);
+    std::string handshake;
+    char byte;
+    while (handshake.find("\r\n\r\n") == std::string::npos) {
+        if (recv(sock, &byte, 1, 0) != 1) {
+            close(sock);
+            return Http::invalidSocket;
+        }
+        handshake.push_back(byte);
+    }
     
     return sock;
 }
 
-static void wsSendTextFrame(int sock, const std::string& text) {
+static void wsSendTextFrame(Http::NativeSocket sock, const std::string& text) {
     std::string frame;
     frame += (char)0x81;  // FIN=1, opcode=1
     
@@ -790,9 +848,9 @@ static void wsSendTextFrame(int sock, const std::string& text) {
     send(sock, frame.c_str(), frame.size(), 0);
 }
 
-static std::string wsRecvFrame(int sock) {
+static std::string wsRecvFrame(Http::NativeSocket sock) {
     char buf[4096];
-    ssize_t n = recv(sock, buf, sizeof(buf), 0);
+    std::ptrdiff_t n = recv(sock, buf, sizeof(buf), 0);
     if (n <= 0) return "";
     
     std::string raw(buf, n);
@@ -847,8 +905,8 @@ TEST(test_ws_echo) {
     server.start();
     waitForServer(WS_PORT);
     
-    int sock = wsConnect(WS_PORT, "/echo");
-    ASSERT(sock >= 0);
+    auto sock = wsConnect(WS_PORT, "/echo");
+    ASSERT(sock != Http::invalidSocket);
     
     // Receive "connected" message
     std::string msg = wsRecvFrame(sock);
@@ -885,9 +943,9 @@ TEST(test_ws_server_push) {
     server.start();
     waitForServer(WS_PORT);
     
-    int sock1 = wsConnect(WS_PORT, "/feed");
-    int sock2 = wsConnect(WS_PORT, "/feed");
-    ASSERT(sock1 >= 0 && sock2 >= 0);
+    auto sock1 = wsConnect(WS_PORT, "/feed");
+    auto sock2 = wsConnect(WS_PORT, "/feed");
+    ASSERT(sock1 != Http::invalidSocket && sock2 != Http::invalidSocket);
     
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     
@@ -896,7 +954,9 @@ TEST(test_ws_server_push) {
         std::lock_guard lock(clientsMutex);
         ASSERT_EQ((int)clients.size(), 2);
         for (auto handle : clients) {
-            server.send(handle, "broadcast");
+            const auto result = server.send(handle, "broadcast");
+            ASSERT(result.status == Http::SocketWriteStatus::complete);
+            ASSERT(result.bytesTransferred > std::string("broadcast").size());
         }
     }
     
@@ -927,8 +987,8 @@ TEST(test_ws_route_variables) {
     server.start();
     waitForServer(WS_PORT);
     
-    int sock = wsConnect(WS_PORT, "/chat/lobby");
-    ASSERT(sock >= 0);
+    auto sock = wsConnect(WS_PORT, "/chat/lobby");
+    ASSERT(sock != Http::invalidSocket);
     
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ASSERT_EQ(capturedRoom, std::string("lobby"));
@@ -940,11 +1000,15 @@ TEST(test_ws_route_variables) {
 TEST(test_ws_binary_message) {
     constexpr int WS_PORT = 53104;
     Http::Server server(WS_PORT);
+    std::atomic<int> sendStatus{-1};
+    std::atomic<size_t> sentBytes{0};
     
     server.ws("/binary", {
         .onOpen = [&](Http::WebSocketHandle handle) {
             std::vector<uint8_t> data = {0x01, 0x02, 0x03, 0x04};
-            server.send(handle, data);
+            const auto result = server.send(handle, data);
+            sentBytes = result.bytesTransferred;
+            sendStatus = static_cast<int>(result.status);
         },
         .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
         .onClose = [](Http::WebSocketHandle) {}
@@ -953,14 +1017,25 @@ TEST(test_ws_binary_message) {
     server.start();
     waitForServer(WS_PORT);
     
-    int sock = wsConnect(WS_PORT, "/binary");
-    ASSERT(sock >= 0);
+    auto sock = wsConnect(WS_PORT, "/binary");
+    ASSERT(sock != Http::invalidSocket);
+    Http::Platform::setReceiveTimeout(sock, std::chrono::seconds(2));
     
     char buf[4096];
-    ssize_t n = recv(sock, buf, sizeof(buf), 0);
-    ASSERT(n > 0);
+    const auto read = Http::Platform::receive(sock, buf, sizeof(buf));
+    for (int i = 0; i < 50 && sendStatus == -1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT(sendStatus == static_cast<int>(Http::SocketWriteStatus::complete));
+    ASSERT(sentBytes > 4);
+    ASSERT(read.status == Http::Platform::SocketReadStatus::data);
+    if (read.status != Http::Platform::SocketReadStatus::data) {
+        close(sock);
+        server.stop();
+        return;
+    }
     
-    std::string raw(buf, n);
+    std::string raw(buf, read.bytesTransferred);
     size_t bytesConsumed = 0;
     Http::WebSocketFrame frame = Http::parseWebSocketFrame(raw, bytesConsumed);
     ASSERT_EQ((int)frame.opcode, 0x2);  // binary
@@ -983,9 +1058,36 @@ TEST(test_ws_invalid_handle) {
     server.start();
     waitForServer(WS_PORT);
     
-    bool result = server.send(99999, "test");
-    ASSERT(!result);
+    auto result = server.send(99999, "test");
+    ASSERT(result.status == Http::SocketWriteStatus::closed);
     
+    server.stop();
+}
+
+TEST(test_ws_send_expired_deadline_is_typed_timeout) {
+    constexpr int WS_PORT = 53110;
+    Http::Server server(WS_PORT);
+    std::atomic<Http::WebSocketHandle> opened{0};
+    server.ws("/deadline", {
+        .onOpen = [&](Http::WebSocketHandle handle) { opened = handle; },
+        .onMessage = [](Http::WebSocketHandle, Http::WebSocketMessage) {},
+        .onClose = [](Http::WebSocketHandle) {}
+    });
+
+    server.start();
+    waitForServer(WS_PORT);
+    auto sock = wsConnect(WS_PORT, "/deadline");
+    for (int i = 0; i < 50 && opened == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    const auto result = server.send(
+        opened, "late",
+        std::chrono::steady_clock::now() - std::chrono::milliseconds(1));
+    ASSERT(result.status == Http::SocketWriteStatus::timeout);
+    ASSERT_EQ(result.bytesTransferred, size_t{0});
+
+    close(sock);
     server.stop();
 }
 
@@ -1026,12 +1128,12 @@ TEST(test_ws_close_connection) {
     server.start();
     waitForServer(WS_PORT);
     
-    int sock = wsConnect(WS_PORT, "/test");
-    ASSERT(sock >= 0);
+    auto sock = wsConnect(WS_PORT, "/test");
+    ASSERT(sock != Http::invalidSocket);
     
     // Should receive close frame
     char buf[4096];
-    ssize_t n = recv(sock, buf, sizeof(buf), 0);
+    std::ptrdiff_t n = recv(sock, buf, sizeof(buf), 0);
     ASSERT(n > 0);
     
     std::string raw(buf, n);
@@ -1063,9 +1165,9 @@ TEST(test_broadcast_text) {
     server.start();
     waitForServer(WS_PORT);
 
-    int sock1 = wsConnect(WS_PORT, "/chat");
-    int sock2 = wsConnect(WS_PORT, "/chat");
-    ASSERT(sock1 >= 0 && sock2 >= 0);
+    auto sock1 = wsConnect(WS_PORT, "/chat");
+    auto sock2 = wsConnect(WS_PORT, "/chat");
+    ASSERT(sock1 != Http::invalidSocket && sock2 != Http::invalidSocket);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -1094,9 +1196,9 @@ TEST(test_broadcast_binary) {
     server.start();
     waitForServer(WS_PORT);
 
-    int sock1 = wsConnect(WS_PORT, "/bin");
-    int sock2 = wsConnect(WS_PORT, "/bin");
-    ASSERT(sock1 >= 0 && sock2 >= 0);
+    auto sock1 = wsConnect(WS_PORT, "/bin");
+    auto sock2 = wsConnect(WS_PORT, "/bin");
+    ASSERT(sock1 != Http::invalidSocket && sock2 != Http::invalidSocket);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -1105,7 +1207,7 @@ TEST(test_broadcast_binary) {
 
     // Read raw frames to check opcode
     char buf[4096];
-    ssize_t n1 = recv(sock1, buf, sizeof(buf), 0);
+    std::ptrdiff_t n1 = recv(sock1, buf, sizeof(buf), 0);
     ASSERT(n1 > 0);
     std::string raw1(buf, n1);
     size_t consumed = 0;
@@ -1113,7 +1215,7 @@ TEST(test_broadcast_binary) {
     ASSERT_EQ((int)frame1.opcode, 0x2);
     ASSERT_EQ((int)frame1.payload.size(), 4);
 
-    ssize_t n2 = recv(sock2, buf, sizeof(buf), 0);
+    std::ptrdiff_t n2 = recv(sock2, buf, sizeof(buf), 0);
     ASSERT(n2 > 0);
     std::string raw2(buf, n2);
     consumed = 0;
@@ -1165,17 +1267,16 @@ TEST(test_broadcast_different_routes) {
     server.start();
     waitForServer(WS_PORT);
 
-    int chatSock = wsConnect(WS_PORT, "/chat");
-    int otherSock = wsConnect(WS_PORT, "/other");
-    ASSERT(chatSock >= 0 && otherSock >= 0);
+    auto chatSock = wsConnect(WS_PORT, "/chat");
+    auto otherSock = wsConnect(WS_PORT, "/other");
+    ASSERT(chatSock != Http::invalidSocket &&
+           otherSock != Http::invalidSocket);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Set a short recv timeout on otherSock so we don't block forever
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 200000;  // 200ms
-    setsockopt(otherSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    Http::Platform::setReceiveTimeout(otherSock,
+                                      std::chrono::milliseconds(200));
 
     server.broadcast("/chat", "chat only");
 
@@ -1184,7 +1285,7 @@ TEST(test_broadcast_different_routes) {
 
     // otherSock should NOT receive anything
     char buf[4096];
-    ssize_t n = recv(otherSock, buf, sizeof(buf), 0);
+    std::ptrdiff_t n = recv(otherSock, buf, sizeof(buf), 0);
     ASSERT(n <= 0);
 
     close(chatSock);
@@ -1205,9 +1306,9 @@ TEST(test_broadcast_pattern_match) {
     server.start();
     waitForServer(WS_PORT);
 
-    int sock1 = wsConnect(WS_PORT, "/room/abc");
-    int sock2 = wsConnect(WS_PORT, "/room/xyz");
-    ASSERT(sock1 >= 0 && sock2 >= 0);
+    auto sock1 = wsConnect(WS_PORT, "/room/abc");
+    auto sock2 = wsConnect(WS_PORT, "/room/xyz");
+    ASSERT(sock1 != Http::invalidSocket && sock2 != Http::invalidSocket);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -1246,6 +1347,10 @@ int main() {
     RUN(test_parseRequest_headers);
     RUN(test_formatResponse_200);
     RUN(test_formatResponse_404);
+    RUN(test_completeWrite_retries_partial_attempts);
+    RUN(test_completeWrite_reports_timeout_after_partial_progress);
+    RUN(test_completeWrite_reports_closed_and_error);
+    RUN(test_completeWrite_rejects_expired_deadline_without_attempt);
 
     std::cout << "\n=== Integration tests ===" << std::endl;
     Http::Server server(TEST_PORT);
@@ -1318,6 +1423,7 @@ int main() {
     RUN(test_ws_route_variables);
     RUN(test_ws_binary_message);
     RUN(test_ws_invalid_handle);
+    RUN(test_ws_send_expired_deadline_is_typed_timeout);
     RUN(test_ws_nonexistent_route_404);
     RUN(test_ws_close_connection);
 
